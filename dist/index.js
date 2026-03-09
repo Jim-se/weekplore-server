@@ -16,7 +16,7 @@ const adminEmailAllowlist = (process.env.ADMIN_EMAILS || '')
     .split(',')
     .map((email) => email.trim().toLowerCase())
     .filter(Boolean);
-const allowedCorsOrigins = (process.env.CORS_ALLOWED_ORIGINS || 'http://localhost:3000,http://127.0.0.1:3000')
+const allowedCorsOrigins = (process.env.CORS_ALLOWED_ORIGINS || 'http://localhost:3000,http://127.0.0.1:3000,http://weekplore.gr,https://weekplore.gr,http://www.weekplore.gr,https://www.weekplore.gr')
     .split(',')
     .map((origin) => origin.trim())
     .filter(Boolean);
@@ -32,9 +32,11 @@ const pickDefined = (source, allowedKeys) => {
 const isNonEmptyString = (value) => typeof value === 'string' && value.trim().length > 0;
 app.use(cors({
     origin(origin, callback) {
+        // If no origin (like mobile apps or curl requests) or origin is in the allowlist
         if (!origin || allowedCorsOrigins.includes(origin)) {
             return callback(null, true);
         }
+        console.error(`CORS blocked for origin: ${origin}`);
         return callback(new Error('Origin not allowed by CORS'));
     }
 }));
@@ -1127,6 +1129,20 @@ app.post('/api/admin/send-email', requireAdmin, async (req, res) => {
     catch (error) {
         res.status(500).json({ error: error.message });
     }
+});
+// --- GLOBAL ERROR HANDLER ---
+app.use((err, req, res, next) => {
+    console.error('SERVER ERROR:', err.message);
+    if (err.stack)
+        console.error(err.stack);
+    // Check if it's a CORS error
+    if (err.message === 'Origin not allowed by CORS') {
+        return res.status(403).json({ error: 'Origin not allowed by CORS policy' });
+    }
+    res.status(500).json({
+        error: 'Internal Server Error',
+        details: process.env.NODE_ENV === 'development' ? err.message : undefined
+    });
 });
 app.listen(PORT, () => {
     console.log(`Server running on http://localhost:${PORT}`);

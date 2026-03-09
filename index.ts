@@ -20,7 +20,7 @@ const adminEmailAllowlist = (process.env.ADMIN_EMAILS || '')
     .split(',')
     .map((email) => email.trim().toLowerCase())
     .filter(Boolean);
-const allowedCorsOrigins = (process.env.CORS_ALLOWED_ORIGINS || 'http://localhost:3000,http://127.0.0.1:3000')
+const allowedCorsOrigins = (process.env.CORS_ALLOWED_ORIGINS || 'http://localhost:3000,http://127.0.0.1:3000,http://weekplore.gr,https://weekplore.gr,http://www.weekplore.gr,https://www.weekplore.gr')
     .split(',')
     .map((origin) => origin.trim())
     .filter(Boolean);
@@ -42,10 +42,12 @@ const isNonEmptyString = (value: unknown): value is string =>
 
 app.use(cors({
     origin(origin, callback) {
+        // If no origin (like mobile apps or curl requests) or origin is in the allowlist
         if (!origin || allowedCorsOrigins.includes(origin)) {
             return callback(null, true);
         }
 
+        console.error(`CORS blocked for origin: ${origin}`);
         return callback(new Error('Origin not allowed by CORS'));
     }
 }));
@@ -328,6 +330,20 @@ app.get('/api/events/:slug', async (req, res) => {
     }
 });
 
+app.get('/api/private-events', async (_req, res) => {
+    try {
+        const { data, error } = await supabase
+            .from('private_events')
+            .select('*')
+            .order('created_at', { ascending: false });
+
+        if (error) throw error;
+        res.json(data);
+    } catch (error: any) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
 // --- BOOKINGS ---
 
 app.post('/api/bookings', async (req, res) => {
@@ -511,16 +527,18 @@ app.post('/api/bookings', async (req, res) => {
                     }) : 'TBD';
 
                     // Snippet formatter (includes cancel_url for all booking emails)
-                    const formatEmail = (text: string, recipientName: string, bookingId: number) => {
+                    const formatEmail = (text: string, recipientName: string, bookingId: number, isHtml = false) => {
                         const cancelToken = generateCancelToken(bookingId);
                         const cancelUrl = `${SERVER_URL}/api/cancel-booking/${bookingId}?token=${cancelToken}`;
+                        const cancelLink = isHtml ? `<a href="${cancelUrl}" style="color: #c0392b; font-weight: bold; text-decoration: underline;">Cancel Reservation</a>` : cancelUrl;
+
                         return text
                             .replace(/{name}/g, recipientName)
                             .replace(/{event}/g, event?.title || 'Experience')
                             .replace(/{date}/g, dateStr)
                             .replace(/{location}/g, event?.location_name || 'TBD')
                             .replace(/{people}/g, formData.numberOfPeople.toString())
-                            .replace(/{cancel_url}/g, cancelUrl);
+                            .replace(/{cancel_url}/g, cancelLink);
                     };
 
                     // --- CALCULATE CURRENT TOTALS FOR EMAIL TRIGGER ---
@@ -545,16 +563,17 @@ app.post('/api/bookings', async (req, res) => {
                     }
 
                     if (templateToUse) {
-                        const body = formatEmail(templateToUse.body, formData.fullName, booking.id);
-                        const subject = formatEmail(templateToUse.subject, formData.fullName, booking.id);
+                        const textBody = formatEmail(templateToUse.body, formData.fullName, booking.id, false);
+                        const htmlBody = formatEmail(templateToUse.body, formData.fullName, booking.id, true).replace(/\n/g, '<br>');
+                        const subject = formatEmail(templateToUse.subject, formData.fullName, booking.id, false);
 
                         try {
                             const { error: sendError } = await resend.emails.send({
                                 from: process.env.EMAIL_FROM || 'info@weekplore.gr',
                                 to: formData.email,
                                 subject: subject,
-                                text: body,
-                                html: body.replace(/\n/g, '<br>'),
+                                text: textBody,
+                                html: htmlBody,
                             });
 
                             if (sendError) throw sendError;
@@ -608,16 +627,17 @@ app.post('/api/bookings', async (req, res) => {
                             const previousBookings = allShiftBookings.filter(b => b.id !== booking.id);
 
                             for (const b of previousBookings) {
-                                const sub = formatEmail(paymentInvitationTemplate.subject, b.full_name, b.id);
-                                const msg = formatEmail(paymentInvitationTemplate.body, b.full_name, b.id);
+                                const sub = formatEmail(paymentInvitationTemplate.subject, b.full_name, b.id, false);
+                                const textMsg = formatEmail(paymentInvitationTemplate.body, b.full_name, b.id, false);
+                                const htmlMsg = formatEmail(paymentInvitationTemplate.body, b.full_name, b.id, true).replace(/\n/g, '<br>');
 
                                 try {
                                     await resend.emails.send({
                                         from: process.env.EMAIL_FROM || 'info@weekplore.gr',
                                         to: b.email,
                                         subject: sub,
-                                        text: msg,
-                                        html: msg.replace(/\n/g, '<br>'),
+                                        text: textMsg,
+                                        html: htmlMsg,
                                     });
 
                                     await supabase.from('email_logs').insert([{
@@ -683,6 +703,20 @@ app.get('/api/admin/events', requireAdmin, async (req, res) => {
         ),
         products(*)
       `)
+            .order('created_at', { ascending: false });
+
+        if (error) throw error;
+        res.json(data);
+    } catch (error: any) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.get('/api/admin/private-events', requireAdmin, async (_req, res) => {
+    try {
+        const { data, error } = await supabase
+            .from('private_events')
+            .select('*')
             .order('created_at', { ascending: false });
 
         if (error) throw error;
@@ -835,6 +869,71 @@ app.delete('/api/admin/events/:id', requireAdmin, async (req, res) => {
         }
         await supabase.from('products').delete().eq('event_id', eventId);
         const { error } = await supabase.from('events').delete().eq('id', eventId);
+        if (error) throw error;
+        res.json({ success: true });
+    } catch (error: any) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.post('/api/admin/private-events', requireAdmin, async (req, res) => {
+    try {
+        const safePrivateEvent = pickDefined(req.body || {}, [
+            'name',
+            'description',
+            'image_url',
+        ]);
+
+        if (!isNonEmptyString(safePrivateEvent.name)) {
+            return res.status(400).json({ error: 'Private event name is required.' });
+        }
+
+        const { data, error } = await supabase
+            .from('private_events')
+            .insert([safePrivateEvent])
+            .select()
+            .single();
+
+        if (error) throw error;
+        res.json(data);
+    } catch (error: any) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.put('/api/admin/private-events/:id', requireAdmin, async (req, res) => {
+    try {
+        const safePrivateEvent = pickDefined(req.body || {}, [
+            'name',
+            'description',
+            'image_url',
+        ]);
+
+        if (Object.keys(safePrivateEvent).length === 0) {
+            return res.status(400).json({ error: 'No valid private event fields provided.' });
+        }
+
+        const { data, error } = await supabase
+            .from('private_events')
+            .update(safePrivateEvent)
+            .eq('id', req.params.id)
+            .select()
+            .single();
+
+        if (error) throw error;
+        res.json(data);
+    } catch (error: any) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.delete('/api/admin/private-events/:id', requireAdmin, async (req, res) => {
+    try {
+        const { error } = await supabase
+            .from('private_events')
+            .delete()
+            .eq('id', req.params.id);
+
         if (error) throw error;
         res.json({ success: true });
     } catch (error: any) {
@@ -1208,6 +1307,22 @@ app.post('/api/admin/send-email', requireAdmin, async (req, res) => {
     } catch (error: any) {
         res.status(500).json({ error: error.message });
     }
+});
+
+// --- GLOBAL ERROR HANDLER ---
+app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
+    console.error('SERVER ERROR:', err.message);
+    if (err.stack) console.error(err.stack);
+
+    // Check if it's a CORS error
+    if (err.message === 'Origin not allowed by CORS') {
+        return res.status(403).json({ error: 'Origin not allowed by CORS policy' });
+    }
+
+    res.status(500).json({
+        error: 'Internal Server Error',
+        details: process.env.NODE_ENV === 'development' ? err.message : undefined
+    });
 });
 
 app.listen(PORT, () => {
