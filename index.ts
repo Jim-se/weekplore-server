@@ -303,6 +303,15 @@ app.get('/api/events', async (req, res) => {
             .order('event_date', { ascending: true });
 
         if (error) throw error;
+
+        if (data) {
+            data.forEach((event: any) => {
+                if (event.products) {
+                    event.products.sort((a: any, b: any) => (a.price || 0) - (b.price || 0));
+                }
+            });
+        }
+
         res.json(data);
     } catch (error: any) {
         res.status(500).json({ error: error.message });
@@ -324,6 +333,11 @@ app.get('/api/events/:slug', async (req, res) => {
             .single();
 
         if (error) throw error;
+
+        if (data && data.products) {
+            data.products.sort((a: any, b: any) => (a.price || 0) - (b.price || 0));
+        }
+
         res.json(data);
     } catch (error: any) {
         res.status(500).json({ error: error.message });
@@ -341,6 +355,189 @@ app.get('/api/private-events', async (_req, res) => {
         res.json(data);
     } catch (error: any) {
         res.status(500).json({ error: error.message });
+    }
+});
+
+app.post('/api/private-event-inquiries', async (req, res) => {
+    const {
+        first_name,
+        last_name,
+        email,
+        phone,
+        number_of_people,
+        date_approx,
+        setting,
+        has_activity,
+        decoration_budget,
+        message,
+        area,
+        is_custom,
+        private_event_template_id
+    } = req.body;
+
+    if (!first_name || !last_name || !email || !phone || !number_of_people || !date_approx || !setting || !area || !message || (decoration_budget === undefined || decoration_budget === null)) {
+        return res.status(400).json({ error: 'Please fill in all required fields.' });
+    }
+
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(email)) {
+        return res.status(400).json({ error: 'Please provide a valid email address.' });
+    }
+
+    try {
+        const { error, data: insertedData } = await supabase
+            .from('private_event_inquiries')
+            .insert([{
+                first_name: first_name.trim(),
+                last_name: last_name.trim(),
+                email: email.trim(),
+                phone: phone.trim(),
+                number_of_people: Number(number_of_people) || null,
+                date_approx: date_approx || null,
+                setting: setting || null,
+                has_activity: Boolean(has_activity),
+                decoration_budget: decoration_budget ? Number(decoration_budget) : null,
+                message: message ? message.trim() : null,
+                area: area || null,
+                is_custom: Boolean(is_custom),
+                private_event_template_id: is_custom ? null : (private_event_template_id || null),
+                status: 'new'
+            }])
+            .select()
+            .single();
+
+        if (error) {
+            console.error('Insert error:', error);
+            throw error;
+        }
+
+        // Send Email Notification to Admin
+        if (process.env.RESEND_API_KEY) {
+            const adminEmail = process.env.PRIVATE_EVENT_ADMIN_EMAIL || adminEmailAllowlist[0];
+            if (adminEmail) {
+                const htmlBody = `
+                    <h2>New Private Event Inquiry</h2>
+                    <p><strong>Name:</strong> ${first_name} ${last_name}</p>
+                    <p><strong>Email:</strong> ${email}</p>
+                    <p><strong>Phone:</strong> ${phone}</p>
+                    <p><strong>Date (approx):</strong> ${date_approx || 'Not specified'}</p>
+                    <p><strong>Number of People:</strong> ${number_of_people || 'Not specified'}</p>
+                    <p><strong>Area:</strong> ${area || 'Not specified'}</p>
+                    <p><strong>Setting:</strong> ${setting || 'Not specified'}</p>
+                    <p><strong>Include Activity:</strong> ${has_activity ? 'Yes' : 'No'}</p>
+                    <p><strong>Decoration Budget:</strong> ${decoration_budget ? `€${decoration_budget}` : 'Not specified'}</p>
+                    <p><strong>Message:</strong><br/>${message ? message.replace(/\\n/g, '<br/>') : 'No message provided'}</p>
+                    <br/>
+                    <p><small>Inquiry ID: ${insertedData?.id || 'N/A'}</small></p>
+                `;
+
+                try {
+                    await resend.emails.send({
+                        from: process.env.EMAIL_FROM || 'info@weekplore.gr',
+                        to: adminEmail,
+                        subject: `New Private Event Inquiry from ${first_name} ${last_name}`,
+                        html: htmlBody,
+                    });
+
+                    await supabase.from('email_logs').insert([{
+                        booking_id: null,
+                        shift_id: null,
+                        event_id: null,
+                        recipient_email: adminEmail,
+                        email_purpose: 'private_event_admin_notification',
+                        status: 'sent',
+                        template_id: null
+                    }]);
+                } catch (emailErr: any) {
+                    console.error('Failed to send admin notification email:', emailErr.message);
+                }
+            }
+
+            // --- SEND AUTO-REPLY TO USER ---
+            try {
+                // Fetch Template from mappings
+                const { data: purposeData } = await supabase
+                    .from('email_purposes')
+                    .select('purpose, template_id, email_templates(*)')
+                    .eq('purpose', 'private_event_inquiry_received')
+                    .single();
+
+                const autoReplyTemplate = purposeData?.email_templates as any;
+
+                if (autoReplyTemplate) {
+                    const recipientName = `${first_name} ${last_name}`.trim();
+                    const eventName = is_custom ? 'Custom Private Event' : 'Private Event';
+                    const dateStr = date_approx || 'TBD';
+                    const locationStr = area || 'TBD';
+                    const peopleStr = number_of_people ? number_of_people.toString() : 'TBD';
+
+                    // Simplified formatter for inquiries
+                    const formatEmail = (text: string, isHtml = false) => {
+                        const formattedText = text
+                            .replace(/{name}/g, recipientName)
+                            .replace(/{event}/g, eventName)
+                            .replace(/{date}/g, dateStr)
+                            .replace(/{location}/g, locationStr)
+                            .replace(/{people}/g, peopleStr)
+                            .replace(/{cancel_url}/g, '#');
+
+                        return isHtml ? formattedText.replace(/\\n/g, '<br>') : formattedText;
+                    };
+
+                    const textBody = formatEmail(autoReplyTemplate.body, false);
+                    const htmlBody = formatEmail(autoReplyTemplate.body, true);
+                    const subject = formatEmail(autoReplyTemplate.subject, false);
+
+                    const { error: sendError } = await resend.emails.send({
+                        from: process.env.EMAIL_FROM || 'info@weekplore.gr',
+                        to: email.trim(),
+                        subject: subject,
+                        text: textBody,
+                        html: htmlBody,
+                    });
+
+                    if (sendError) throw sendError;
+
+                    const { error: logError } = await supabase.from('email_logs').insert([{
+                        booking_id: null,
+                        shift_id: null,
+                        event_id: null,
+                        recipient_email: email.trim(),
+                        email_purpose: 'private_event_inquiry_received',
+                        status: 'sent',
+                        template_id: autoReplyTemplate.id
+                    }]);
+                }
+            } catch (err: any) {
+                console.error(`Failed to send private event auto-reply email:`, err.message);
+
+                // Fetch the template ID if we failed after retrieving it
+                let templateId = null;
+                try {
+                    const { data } = await supabase
+                        .from('email_purposes')
+                        .select('template_id')
+                        .eq('purpose', 'private_event_inquiry_received')
+                        .single();
+                    templateId = data?.template_id;
+                } catch { /* ignore */ }
+
+                await supabase.from('email_logs').insert([{
+                    booking_id: null,
+                    shift_id: null,
+                    event_id: null,
+                    recipient_email: email.trim(),
+                    email_purpose: 'private_event_inquiry_received',
+                    status: 'failed',
+                    template_id: templateId,
+                    error_message: err.message
+                }]);
+            }
+        }
+
+        res.json({ success: true, message: 'Inquiry submitted successfully.' });
+    } catch (error: any) {
+        res.status(500).json({ error: 'Failed to submit inquiry. Please try again later.', details: error.message });
     }
 });
 
@@ -529,8 +726,8 @@ app.post('/api/bookings', async (req, res) => {
                     // Snippet formatter (includes cancel_url for all booking emails)
                     const formatEmail = (text: string, recipientName: string, bookingId: number, isHtml = false) => {
                         const cancelToken = generateCancelToken(bookingId);
-                        const cancelUrl = `${SERVER_URL}/api/cancel-booking/${bookingId}?token=${cancelToken}`;
-                        const cancelLink = isHtml ? `<a href="${cancelUrl}" style="color: #c0392b; font-weight: bold; text-decoration: underline;">Cancel Reservation</a>` : cancelUrl;
+                        const cancelUrl = `${SERVER_URL} /api/cancel - booking / ${bookingId}?token = ${cancelToken} `;
+                        const cancelLink = isHtml ? `< a href = "${cancelUrl}" style = "color: #c0392b; font-weight: bold; text-decoration: underline;" > Cancel Reservation </a>` : cancelUrl;
 
                         return text
                             .replace(/{name}/g, recipientName)
@@ -706,6 +903,15 @@ app.get('/api/admin/events', requireAdmin, async (req, res) => {
             .order('created_at', { ascending: false });
 
         if (error) throw error;
+
+        if (data) {
+            data.forEach((event: any) => {
+                if (event.products) {
+                    event.products.sort((a: any, b: any) => (a.price || 0) - (b.price || 0));
+                }
+            });
+        }
+
         res.json(data);
     } catch (error: any) {
         res.status(500).json({ error: error.message });
@@ -717,6 +923,23 @@ app.get('/api/admin/private-events', requireAdmin, async (_req, res) => {
         const { data, error } = await supabase
             .from('private_events')
             .select('*')
+            .order('created_at', { ascending: false });
+
+        if (error) throw error;
+        res.json(data);
+    } catch (error: any) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.get('/api/admin/private-event-inquiries', requireAdmin, async (_req, res) => {
+    try {
+        const { data, error } = await supabase
+            .from('private_event_inquiries')
+            .select(`
+                *,
+                private_event_templates:private_event_template_id(name)
+            `)
             .order('created_at', { ascending: false });
 
         if (error) throw error;
@@ -1091,13 +1314,14 @@ app.get('/api/reviews/visible', async (req, res) => {
 
 app.post('/api/reviews', async (req, res) => {
     const safeReview = {
+        name: req.body?.name,
         email: req.body?.email,
         start: req.body?.start,
         review: req.body?.review,
         status: 'pending',
     };
 
-    if (!isNonEmptyString(safeReview.email) || !Number.isInteger(safeReview.start) || safeReview.start < 1 || safeReview.start > 5 || !isNonEmptyString(safeReview.review)) {
+    if (!isNonEmptyString(safeReview.name) || !isNonEmptyString(safeReview.email) || !Number.isInteger(safeReview.start) || safeReview.start < 1 || safeReview.start > 5 || !isNonEmptyString(safeReview.review)) {
         return res.status(400).json({ error: 'Invalid review payload.' });
     }
 
