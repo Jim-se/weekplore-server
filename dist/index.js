@@ -12,6 +12,7 @@ const supabase = createClient(supabaseUrl, supabaseKey);
 const resend = new Resend(process.env.RESEND_API_KEY);
 const app = express();
 const PORT = process.env.PORT || 3001;
+app.set('trust proxy', 1);
 const adminEmailAllowlist = (process.env.ADMIN_EMAILS || '')
     .split(',')
     .map((email) => email.trim().toLowerCase())
@@ -20,6 +21,17 @@ const allowedCorsOrigins = (process.env.CORS_ALLOWED_ORIGINS || 'http://localhos
     .split(',')
     .map((origin) => origin.trim())
     .filter(Boolean);
+const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const CONTROL_CHAR_REGEX = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g;
+const CANCEL_BOOKING_ROUTE = '/api/cancel-booking';
+const BOOKING_RATE_LIMIT_WINDOW_MS = 10 * 60 * 1000;
+const BOOKING_RATE_LIMIT_MAX_REQUESTS = 5;
+const BOOKING_RATE_LIMIT_CLEANUP_EVERY = 100;
+const DUPLICATE_BOOKING_ERROR_MESSAGE = 'This email has already booked this shift.';
+const DUPLICATE_BOOKING_CONSTRAINT = 'bookings_unique_shift_email_idx';
+const bookingRateLimitStore = new Map();
+const activeBookingKeys = new Set();
+let bookingRateLimitChecks = 0;
 const pickDefined = (source, allowedKeys) => {
     const result = {};
     for (const key of allowedKeys) {
@@ -30,6 +42,98 @@ const pickDefined = (source, allowedKeys) => {
     return result;
 };
 const isNonEmptyString = (value) => typeof value === 'string' && value.trim().length > 0;
+const isPlainObject = (value) => typeof value === 'object' && value !== null && Object.getPrototypeOf(value) === Object.prototype;
+const sanitizeStringInput = (value, options = {}) => {
+    const { lowercase = false, maxLength = 5000, preserveNewlines = true } = options;
+    const normalizedLineBreaks = value.replace(/\r\n/g, '\n');
+    const withoutControlChars = normalizedLineBreaks.replace(CONTROL_CHAR_REGEX, '');
+    const collapsed = preserveNewlines
+        ? withoutControlChars
+        : withoutControlChars.replace(/\s+/g, ' ');
+    const trimmed = collapsed.trim().slice(0, maxLength);
+    return lowercase ? trimmed.toLowerCase() : trimmed;
+};
+const sanitizeRequestPayload = (value) => {
+    if (typeof value === 'string') {
+        return sanitizeStringInput(value);
+    }
+    if (Array.isArray(value)) {
+        return value.map((entry) => sanitizeRequestPayload(entry));
+    }
+    if (isPlainObject(value)) {
+        return Object.fromEntries(Object.entries(value).map(([key, entry]) => [key, sanitizeRequestPayload(entry)]));
+    }
+    return value;
+};
+const normalizeEmail = (value) => typeof value === 'string'
+    ? sanitizeStringInput(value, { lowercase: true, maxLength: 254, preserveNewlines: false })
+    : '';
+const normalizePhone = (value) => typeof value === 'string'
+    ? sanitizeStringInput(value, { maxLength: 40, preserveNewlines: false })
+    : '';
+const normalizeSingleLineText = (value, maxLength = 255) => typeof value === 'string'
+    ? sanitizeStringInput(value, { maxLength, preserveNewlines: false })
+    : '';
+const normalizeMultilineText = (value, maxLength = 4000) => typeof value === 'string'
+    ? sanitizeStringInput(value, { maxLength, preserveNewlines: true })
+    : '';
+const escapeHtml = (value) => value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+const isDuplicateShiftEmailBookingError = (error) => {
+    const candidate = error;
+    if (!candidate || candidate.code !== '23505') {
+        return false;
+    }
+    const searchableText = [candidate.message, candidate.details, candidate.hint]
+        .filter((value) => typeof value === 'string')
+        .join(' ')
+        .toLowerCase();
+    return searchableText.includes(DUPLICATE_BOOKING_CONSTRAINT) ||
+        searchableText.includes('(shift_id, lower(email))') ||
+        searchableText.includes('lower(email)');
+};
+const getClientIp = (req) => {
+    const forwardedFor = req.headers['x-forwarded-for'];
+    if (typeof forwardedFor === 'string' && forwardedFor.trim().length > 0) {
+        return forwardedFor.split(',')[0].trim();
+    }
+    if (Array.isArray(forwardedFor) && forwardedFor.length > 0) {
+        return forwardedFor[0];
+    }
+    return req.ip || req.socket.remoteAddress || 'unknown';
+};
+const pruneRateLimitStore = (now) => {
+    for (const [ip, timestamps] of bookingRateLimitStore.entries()) {
+        const recentHits = timestamps.filter((timestamp) => now - timestamp < BOOKING_RATE_LIMIT_WINDOW_MS);
+        if (recentHits.length === 0) {
+            bookingRateLimitStore.delete(ip);
+            continue;
+        }
+        bookingRateLimitStore.set(ip, recentHits);
+    }
+};
+const bookingRateLimit = (req, res, next) => {
+    const ip = getClientIp(req);
+    const now = Date.now();
+    const recentHits = (bookingRateLimitStore.get(ip) || []).filter((timestamp) => now - timestamp < BOOKING_RATE_LIMIT_WINDOW_MS);
+    if (recentHits.length >= BOOKING_RATE_LIMIT_MAX_REQUESTS) {
+        res.set('Retry-After', Math.ceil(BOOKING_RATE_LIMIT_WINDOW_MS / 1000).toString());
+        return res.status(429).json({
+            error: 'Too many booking attempts from this IP. Please wait 10 minutes and try again.'
+        });
+    }
+    recentHits.push(now);
+    bookingRateLimitStore.set(ip, recentHits);
+    bookingRateLimitChecks += 1;
+    if (bookingRateLimitChecks % BOOKING_RATE_LIMIT_CLEANUP_EVERY === 0) {
+        pruneRateLimitStore(now);
+    }
+    next();
+};
 app.use(cors({
     origin(origin, callback) {
         // If no origin (like mobile apps or curl requests) or origin is in the allowlist
@@ -41,6 +145,12 @@ app.use(cors({
     }
 }));
 app.use(express.json());
+app.use((req, _res, next) => {
+    if (req.body && typeof req.body === 'object') {
+        req.body = sanitizeRequestPayload(req.body);
+    }
+    next();
+});
 app.get('/api/health', (_req, res) => {
     res.json({ status: 'ok' });
 });
@@ -92,10 +202,12 @@ const isValidISODatetime = (iso) => {
 };
 // --- CANCEL TOKEN HELPER ---
 const CANCEL_SECRET = process.env.CANCEL_SECRET || 'weekplore-cancel-secret-change-me';
-const SERVER_URL = process.env.SERVER_URL || `http://localhost:${process.env.PORT || 3001}`;
+const SERVER_URL = (process.env.SERVER_URL || `http://localhost:${process.env.PORT || 3001}`).replace(/\/+$/, '');
 const generateCancelToken = (bookingId) => {
     return crypto.createHmac('sha256', CANCEL_SECRET).update(String(bookingId)).digest('hex');
 };
+const buildCancelBookingPath = (bookingId, token) => `${CANCEL_BOOKING_ROUTE}/${encodeURIComponent(String(bookingId))}?token=${encodeURIComponent(token)}`;
+const buildCancelBookingUrl = (bookingId, token) => `${SERVER_URL}${buildCancelBookingPath(bookingId, token)}`;
 const verifyCancelToken = (bookingId, token) => {
     const expected = generateCancelToken(bookingId);
     try {
@@ -135,11 +247,11 @@ const cancelPageHtml = (bookingName, eventTitle, bookingId, token) => `
   <div class="card">
     <div class="icon">⚠️</div>
     <div class="label">Booking Cancellation</div>
-    <h1>Are you sure, <span class="name">${bookingName.split(' ')[0]}?</span></h1>
+    <h1>Are you sure, <span class="name">${escapeHtml(bookingName.split(' ')[0] || 'there')}?</span></h1>
     <p style="margin-top: 16px;">You are about to cancel your booking for</p>
-    <p class="event">${eventTitle}</p>
+    <p class="event">${escapeHtml(eventTitle)}</p>
     <div class="warning">This action is permanent and cannot be undone.</div>
-    <form method="POST" action="/api/cancel-booking/${bookingId}?token=${token}">
+    <form method="POST" action="${buildCancelBookingPath(bookingId, token)}">
       <button type="submit" class="btn-cancel">Yes, Cancel My Booking</button>
     </form>
     <a href="/" class="btn-keep">No, Keep My Booking</a>
@@ -172,8 +284,8 @@ const cancelSuccessHtml = (bookingName, eventTitle) => `
   <div class="card">
     <div class="icon">✓</div>
     <div class="label">Cancellation Confirmed</div>
-    <h1>Done, ${bookingName.split(' ')[0]}.</h1>
-    <p>Your booking for <span class="event">${eventTitle}</span> has been successfully cancelled.</p>
+    <h1>Done, ${escapeHtml(bookingName.split(' ')[0] || 'there')}.</h1>
+    <p>Your booking for <span class="event">${escapeHtml(eventTitle)}</span> has been successfully cancelled.</p>
     <p>We hope to see you at a future Weekplore experience.</p>
     <a href="/" class="btn-home">Back to Weekplore</a>
     <p class="footer">Weekplore · Thank you for letting us know.</p>
@@ -200,7 +312,7 @@ const cancelErrorHtml = (message) => `
   <div class="card">
     <div class="icon">❌</div>
     <h1>Something went wrong</h1>
-    <p>${message}</p>
+    <p>${escapeHtml(message)}</p>
   </div>
 </body>
 </html>
@@ -272,6 +384,13 @@ app.get('/api/events', async (req, res) => {
             .order('event_date', { ascending: true });
         if (error)
             throw error;
+        if (data) {
+            data.forEach((event) => {
+                if (event.products) {
+                    event.products.sort((a, b) => (a.price || 0) - (b.price || 0));
+                }
+            });
+        }
         res.json(data);
     }
     catch (error) {
@@ -293,18 +412,220 @@ app.get('/api/events/:slug', async (req, res) => {
             .single();
         if (error)
             throw error;
+        if (data && data.products) {
+            data.products.sort((a, b) => (a.price || 0) - (b.price || 0));
+        }
         res.json(data);
     }
     catch (error) {
         res.status(500).json({ error: error.message });
     }
 });
+app.get('/api/private-events', async (_req, res) => {
+    try {
+        const { data, error } = await supabase
+            .from('private_events')
+            .select('*')
+            .order('created_at', { ascending: false });
+        if (error)
+            throw error;
+        res.json(data);
+    }
+    catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+app.post('/api/private-event-inquiries', async (req, res) => {
+    const firstName = normalizeSingleLineText(req.body?.first_name, 80);
+    const lastName = normalizeSingleLineText(req.body?.last_name, 80);
+    const email = normalizeEmail(req.body?.email);
+    const phone = normalizePhone(req.body?.phone);
+    const normalizedPeople = Number(req.body?.number_of_people);
+    const dateApprox = normalizeSingleLineText(req.body?.date_approx, 10);
+    const setting = normalizeSingleLineText(req.body?.setting, 40);
+    const area = normalizeSingleLineText(req.body?.area, 120);
+    const message = normalizeMultilineText(req.body?.message, 4000);
+    const normalizedDecorationBudget = Number(req.body?.decoration_budget);
+    const isCustom = Boolean(req.body?.is_custom);
+    const hasActivity = Boolean(req.body?.has_activity);
+    const privateEventTemplateId = isCustom
+        ? null
+        : normalizeSingleLineText(req.body?.private_event_template_id, 64) || null;
+    if (!firstName || !lastName || !email || !phone || !dateApprox || !setting || !area || !message || req.body?.decoration_budget === undefined || req.body?.decoration_budget === null) {
+        return res.status(400).json({ error: 'Please fill in all required fields.' });
+    }
+    if (!EMAIL_REGEX.test(email)) {
+        return res.status(400).json({ error: 'Please provide a valid email address.' });
+    }
+    if (!Number.isInteger(normalizedPeople) || normalizedPeople < 1) {
+        return res.status(400).json({ error: 'Please provide a valid number of guests.' });
+    }
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(dateApprox)) {
+        return res.status(400).json({ error: 'Please provide a valid approximate date.' });
+    }
+    if (!Number.isFinite(normalizedDecorationBudget) || normalizedDecorationBudget < 0) {
+        return res.status(400).json({ error: 'Please provide a valid decoration budget.' });
+    }
+    try {
+        const { error, data: insertedData } = await supabase
+            .from('private_event_inquiries')
+            .insert([{
+                first_name: firstName,
+                last_name: lastName,
+                email,
+                phone,
+                number_of_people: normalizedPeople,
+                date_approx: dateApprox,
+                setting: setting || null,
+                has_activity: hasActivity,
+                decoration_budget: normalizedDecorationBudget,
+                message: message || null,
+                area: area || null,
+                is_custom: isCustom,
+                private_event_template_id: privateEventTemplateId,
+                status: 'new'
+            }])
+            .select()
+            .single();
+        if (error) {
+            console.error('Insert error:', error);
+            throw error;
+        }
+        // Send Email Notification to Admin
+        if (process.env.RESEND_API_KEY) {
+            const adminEmail = process.env.PRIVATE_EVENT_ADMIN_EMAIL || adminEmailAllowlist[0];
+            if (adminEmail) {
+                const safeMessage = message ? escapeHtml(message).replace(/\n/g, '<br/>') : 'No message provided';
+                const htmlBody = `
+                    <h2>New Private Event Inquiry</h2>
+                    <p><strong>Name:</strong> ${escapeHtml(`${firstName} ${lastName}`)}</p>
+                    <p><strong>Email:</strong> ${escapeHtml(email)}</p>
+                    <p><strong>Phone:</strong> ${escapeHtml(phone)}</p>
+                    <p><strong>Date (approx):</strong> ${escapeHtml(dateApprox || 'Not specified')}</p>
+                    <p><strong>Number of People:</strong> ${normalizedPeople || 'Not specified'}</p>
+                    <p><strong>Area:</strong> ${escapeHtml(area || 'Not specified')}</p>
+                    <p><strong>Setting:</strong> ${escapeHtml(setting || 'Not specified')}</p>
+                    <p><strong>Include Activity:</strong> ${hasActivity ? 'Yes' : 'No'}</p>
+                    <p><strong>Decoration Budget:</strong> €${normalizedDecorationBudget}</p>
+                    <p><strong>Message:</strong><br/>${safeMessage}</p>
+                    <br/>
+                    <p><small>Inquiry ID: ${insertedData?.id || 'N/A'}</small></p>
+                `;
+                try {
+                    await resend.emails.send({
+                        from: process.env.EMAIL_FROM || 'info@weekplore.gr',
+                        to: adminEmail,
+                        subject: `New Private Event Inquiry from ${firstName} ${lastName}`,
+                        html: htmlBody,
+                    });
+                    await supabase.from('email_logs').insert([{
+                            booking_id: null,
+                            shift_id: null,
+                            event_id: null,
+                            recipient_email: adminEmail,
+                            email_purpose: 'private_event_admin_notification',
+                            status: 'sent',
+                            template_id: null
+                        }]);
+                }
+                catch (emailErr) {
+                    console.error('Failed to send admin notification email:', emailErr.message);
+                }
+            }
+            // --- SEND AUTO-REPLY TO USER ---
+            try {
+                // Fetch Template from mappings
+                const { data: purposeData } = await supabase
+                    .from('email_purposes')
+                    .select('purpose, template_id, email_templates(*)')
+                    .eq('purpose', 'private_event_inquiry_received')
+                    .single();
+                const autoReplyTemplate = purposeData?.email_templates;
+                if (autoReplyTemplate) {
+                    const recipientName = `${firstName} ${lastName}`.trim();
+                    const eventName = isCustom ? 'Custom Private Event' : 'Private Event';
+                    const dateStr = dateApprox || 'TBD';
+                    const locationStr = area || 'TBD';
+                    const peopleStr = normalizedPeople ? normalizedPeople.toString() : 'TBD';
+                    // Simplified formatter for inquiries
+                    const formatEmail = (text, isHtml = false) => {
+                        const safeRecipientName = isHtml ? escapeHtml(recipientName) : recipientName;
+                        const safeEventName = isHtml ? escapeHtml(eventName) : eventName;
+                        const safeDateStr = isHtml ? escapeHtml(dateStr) : dateStr;
+                        const safeLocationStr = isHtml ? escapeHtml(locationStr) : locationStr;
+                        const formattedText = text
+                            .replace(/{name}/g, safeRecipientName)
+                            .replace(/{event}/g, safeEventName)
+                            .replace(/{date}/g, safeDateStr)
+                            .replace(/{location}/g, safeLocationStr)
+                            .replace(/{people}/g, peopleStr)
+                            .replace(/{cancel_url}/g, '#');
+                        return isHtml ? formattedText.replace(/\n/g, '<br>') : formattedText;
+                    };
+                    const textBody = formatEmail(autoReplyTemplate.body, false);
+                    const htmlBody = formatEmail(autoReplyTemplate.body, true);
+                    const subject = formatEmail(autoReplyTemplate.subject, false);
+                    const { error: sendError } = await resend.emails.send({
+                        from: process.env.EMAIL_FROM || 'info@weekplore.gr',
+                        to: email,
+                        subject: subject,
+                        text: textBody,
+                        html: htmlBody,
+                    });
+                    if (sendError)
+                        throw sendError;
+                    const { error: logError } = await supabase.from('email_logs').insert([{
+                            booking_id: null,
+                            shift_id: null,
+                            event_id: null,
+                            recipient_email: email,
+                            email_purpose: 'private_event_inquiry_received',
+                            status: 'sent',
+                            template_id: autoReplyTemplate.id
+                        }]);
+                }
+            }
+            catch (err) {
+                console.error(`Failed to send private event auto-reply email:`, err.message);
+                // Fetch the template ID if we failed after retrieving it
+                let templateId = null;
+                try {
+                    const { data } = await supabase
+                        .from('email_purposes')
+                        .select('template_id')
+                        .eq('purpose', 'private_event_inquiry_received')
+                        .single();
+                    templateId = data?.template_id;
+                }
+                catch { /* ignore */ }
+                await supabase.from('email_logs').insert([{
+                        booking_id: null,
+                        shift_id: null,
+                        event_id: null,
+                        recipient_email: email,
+                        email_purpose: 'private_event_inquiry_received',
+                        status: 'failed',
+                        template_id: templateId,
+                        error_message: err.message
+                    }]);
+            }
+        }
+        res.json({ success: true, message: 'Inquiry submitted successfully.' });
+    }
+    catch (error) {
+        console.error('Private event inquiry error:', error);
+        res.status(500).json({ error: 'Failed to submit inquiry. Please try again later.' });
+    }
+});
 // --- BOOKINGS ---
-app.post('/api/bookings', async (req, res) => {
+app.post('/api/bookings', bookingRateLimit, async (req, res) => {
     const { eventId, formData } = req.body ?? {};
     const normalizedEventId = Number(eventId);
     const normalizedShiftId = Number(formData?.shiftId);
     const normalizedPeople = Number(formData?.numberOfPeople);
+    const normalizedFullName = normalizeSingleLineText(formData?.fullName, 120);
+    const normalizedEmail = normalizeEmail(formData?.email);
+    const normalizedPhone = normalizePhone(formData?.phone);
     const selectedProducts = Array.isArray(formData?.products) ? formData.products : [];
     // --- 1. SERVER-SIDE VALIDATION & CAPACITY CHECKS ---
     if (!Number.isInteger(normalizedEventId) ||
@@ -312,18 +633,27 @@ app.post('/api/bookings', async (req, res) => {
         !formData ||
         !Number.isInteger(normalizedShiftId) ||
         normalizedShiftId < 1 ||
-        !isNonEmptyString(formData.fullName) ||
-        !isNonEmptyString(formData.email) ||
-        !isNonEmptyString(formData.phone)) {
+        !normalizedFullName ||
+        !normalizedEmail ||
+        !normalizedPhone) {
         return res.status(400).json({ error: 'Missing required booking information' });
+    }
+    if (!EMAIL_REGEX.test(normalizedEmail)) {
+        return res.status(400).json({ error: 'Please provide a valid email address.' });
     }
     if (!Number.isInteger(normalizedPeople) || normalizedPeople < 1) {
         return res.status(400).json({ error: 'Invalid number of people.' });
     }
+    const bookingKey = `${normalizedShiftId}:${normalizedEmail}`;
+    if (activeBookingKeys.has(bookingKey)) {
+        return res.status(409).json({ error: 'A booking for this email and shift is already being processed.' });
+    }
+    activeBookingKeys.add(bookingKey);
     try {
+        let productTotal = 0;
         const { data: event, error: eventError } = await supabase
             .from('events')
-            .select('id, is_hidden, is_sold_out, booking_deadline')
+            .select('id, price, is_hidden, is_sold_out, booking_deadline')
             .eq('id', normalizedEventId)
             .single();
         if (eventError || !event) {
@@ -356,6 +686,17 @@ app.post('/api/bookings', async (req, res) => {
         if (shift.is_full) {
             return res.status(400).json({ error: 'This shift is already full.' });
         }
+        const { data: duplicateBookings, error: duplicateBookingsError } = await supabase
+            .from('bookings')
+            .select('id')
+            .eq('shift_id', normalizedShiftId)
+            .ilike('email', normalizedEmail)
+            .limit(1);
+        if (duplicateBookingsError)
+            throw duplicateBookingsError;
+        if ((duplicateBookings || []).length > 0) {
+            return res.status(409).json({ error: DUPLICATE_BOOKING_ERROR_MESSAGE });
+        }
         const { data: existingBookings, error: bookingsErr } = await supabase
             .from('bookings')
             .select('number_of_people')
@@ -384,7 +725,7 @@ app.post('/api/bookings', async (req, res) => {
             const productIds = [...new Set(selectedProducts.map((product) => product.product_id))];
             const { data: validProducts, error: prodErr } = await supabase
                 .from('products')
-                .select('id')
+                .select('id, price')
                 .in('id', productIds)
                 .eq('event_id', normalizedEventId);
             if (prodErr)
@@ -392,7 +733,10 @@ app.post('/api/bookings', async (req, res) => {
             if ((validProducts || []).length !== productIds.length) {
                 return res.status(400).json({ error: 'Invalid product selected.' });
             }
+            const productPriceById = new Map((validProducts || []).map((product) => [product.id, Number(product.price) || 0]));
+            productTotal = selectedProducts.reduce((sum, product) => sum + (product.quantity * (productPriceById.get(product.product_id) || 0)), 0);
         }
+        const totalBill = ((Number(event.price) || 0) * normalizedPeople) + productTotal;
         // --- 2. Insert booking into Supabase ---
         const { data: booking, error: bookingError } = await supabase
             .from('bookings')
@@ -400,17 +744,22 @@ app.post('/api/bookings', async (req, res) => {
             {
                 event_id: normalizedEventId,
                 shift_id: normalizedShiftId,
-                full_name: formData.fullName.trim(),
-                email: formData.email.trim(),
-                phone: formData.phone.trim(),
+                full_name: normalizedFullName,
+                email: normalizedEmail,
+                phone: normalizedPhone,
                 number_of_people: normalizedPeople,
-                payment_status: 'pending'
+                payment_status: 'pending',
+                bill: totalBill
             }
         ])
             .select()
             .single();
-        if (bookingError)
+        if (bookingError) {
+            if (isDuplicateShiftEmailBookingError(bookingError)) {
+                return res.status(409).json({ error: DUPLICATE_BOOKING_ERROR_MESSAGE });
+            }
             throw bookingError;
+        }
         // --- 3. Insert booking products if any ---
         if (selectedProducts.length > 0) {
             const bookingProducts = selectedProducts.map((p) => ({
@@ -421,8 +770,24 @@ app.post('/api/bookings', async (req, res) => {
             const { error: productsError } = await supabase
                 .from('booking_products')
                 .insert(bookingProducts);
-            if (productsError)
+            if (productsError) {
+                console.error('Booking products insert failed, rolling back booking:', productsError.message);
+                const { error: rollbackProductsError } = await supabase
+                    .from('booking_products')
+                    .delete()
+                    .eq('booking_id', booking.id);
+                if (rollbackProductsError) {
+                    console.error('Failed to roll back booking products:', rollbackProductsError.message);
+                }
+                const { error: rollbackBookingError } = await supabase
+                    .from('bookings')
+                    .delete()
+                    .eq('id', booking.id);
+                if (rollbackBookingError) {
+                    console.error('Failed to roll back booking after products error:', rollbackBookingError.message);
+                }
                 throw productsError;
+            }
         }
         // --- 4. Email Logic (Run asynchronously so it doesn't block the response) ---
         if (process.env.RESEND_API_KEY) {
@@ -443,29 +808,36 @@ app.post('/api/bookings', async (req, res) => {
                     const { data: event } = await supabase
                         .from('events')
                         .select('id, title, location_name')
-                        .eq('id', eventId)
+                        .eq('id', normalizedEventId)
                         .single();
                     const dateStr = shift ? new Date(shift.start_time).toLocaleString('en-GB', {
                         dateStyle: 'full',
                         timeStyle: 'short'
                     }) : 'TBD';
                     // Snippet formatter (includes cancel_url for all booking emails)
-                    const formatEmail = (text, recipientName, bookingId) => {
+                    const formatEmail = (text, recipientName, bookingId, isHtml = false) => {
                         const cancelToken = generateCancelToken(bookingId);
-                        const cancelUrl = `${SERVER_URL}/api/cancel-booking/${bookingId}?token=${cancelToken}`;
+                        const cancelUrl = buildCancelBookingUrl(bookingId, cancelToken);
+                        const safeRecipientName = isHtml ? escapeHtml(recipientName) : recipientName;
+                        const safeEventTitle = isHtml ? escapeHtml(event?.title || 'Experience') : event?.title || 'Experience';
+                        const safeDateStr = isHtml ? escapeHtml(dateStr) : dateStr;
+                        const safeLocationName = isHtml ? escapeHtml(event?.location_name || 'TBD') : event?.location_name || 'TBD';
+                        const cancelLink = isHtml
+                            ? `<a href="${cancelUrl}" style="color: #c0392b; font-weight: bold; text-decoration: underline;">Cancel Reservation</a>`
+                            : cancelUrl;
                         return text
-                            .replace(/{name}/g, recipientName)
-                            .replace(/{event}/g, event?.title || 'Experience')
-                            .replace(/{date}/g, dateStr)
-                            .replace(/{location}/g, event?.location_name || 'TBD')
-                            .replace(/{people}/g, formData.numberOfPeople.toString())
-                            .replace(/{cancel_url}/g, cancelUrl);
+                            .replace(/{name}/g, safeRecipientName)
+                            .replace(/{event}/g, safeEventTitle)
+                            .replace(/{date}/g, safeDateStr)
+                            .replace(/{location}/g, safeLocationName)
+                            .replace(/{people}/g, normalizedPeople.toString())
+                            .replace(/{cancel_url}/g, cancelLink);
                     };
                     // --- CALCULATE CURRENT TOTALS FOR EMAIL TRIGGER ---
                     const { data: allShiftBookings } = await supabase
                         .from('bookings')
                         .select('id, number_of_people, email, full_name')
-                        .eq('shift_id', formData.shiftId);
+                        .eq('shift_id', normalizedShiftId);
                     const emailTotalPeople = allShiftBookings?.reduce((sum, b) => sum + (b.number_of_people || 0), 0) || 0;
                     const isGoalMetNow = shift && shift.people_counter > 0 && emailTotalPeople >= shift.people_counter;
                     // --- SEND TO THE NEW BOOKER ---
@@ -480,23 +852,24 @@ app.post('/api/bookings', async (req, res) => {
                         purposeToUse = 'interest_received';
                     }
                     if (templateToUse) {
-                        const body = formatEmail(templateToUse.body, formData.fullName, booking.id);
-                        const subject = formatEmail(templateToUse.subject, formData.fullName, booking.id);
+                        const textBody = formatEmail(templateToUse.body, normalizedFullName, booking.id, false);
+                        const htmlBody = formatEmail(templateToUse.body, normalizedFullName, booking.id, true).replace(/\n/g, '<br>');
+                        const subject = formatEmail(templateToUse.subject, normalizedFullName, booking.id, false);
                         try {
                             const { error: sendError } = await resend.emails.send({
                                 from: process.env.EMAIL_FROM || 'info@weekplore.gr',
-                                to: formData.email,
+                                to: normalizedEmail,
                                 subject: subject,
-                                text: body,
-                                html: body.replace(/\n/g, '<br>'),
+                                text: textBody,
+                                html: htmlBody,
                             });
                             if (sendError)
                                 throw sendError;
                             await supabase.from('email_logs').insert([{
                                     booking_id: booking.id,
-                                    shift_id: formData.shiftId,
-                                    event_id: eventId,
-                                    recipient_email: formData.email,
+                                    shift_id: normalizedShiftId,
+                                    event_id: normalizedEventId,
+                                    recipient_email: normalizedEmail,
                                     email_purpose: purposeToUse,
                                     status: 'sent',
                                     template_id: templateToUse.id
@@ -506,9 +879,9 @@ app.post('/api/bookings', async (req, res) => {
                             console.error(`Failed to send ${purposeToUse} email:`, err.message);
                             await supabase.from('email_logs').insert([{
                                     booking_id: booking.id,
-                                    shift_id: formData.shiftId,
-                                    event_id: eventId,
-                                    recipient_email: formData.email,
+                                    shift_id: normalizedShiftId,
+                                    event_id: normalizedEventId,
+                                    recipient_email: normalizedEmail,
                                     email_purpose: purposeToUse,
                                     status: 'failed',
                                     template_id: templateToUse.id,
@@ -519,13 +892,13 @@ app.post('/api/bookings', async (req, res) => {
                     // --- 6. CHECK THRESHOLD FOR BULK EMAIL ---
                     console.log(`Checking threshold: emailTotalPeople=${emailTotalPeople}, people_counter=${shift?.people_counter}, is_confirmed=${shift?.is_confirmed}`);
                     if (isGoalMetNow && shift && !shift.is_confirmed) {
-                        console.log(`Threshold MET for shift ${formData.shiftId}. Updating shift and sending bulk emails.`);
+                        console.log(`Threshold MET for shift ${normalizedShiftId}. Updating shift and sending bulk emails.`);
                         if (paymentInvitationTemplate && allShiftBookings) {
                             // Mark as confirmed in DB
                             const { error: updateError } = await supabase
                                 .from('shifts')
                                 .update({ is_confirmed: true })
-                                .eq('id', formData.shiftId);
+                                .eq('id', normalizedShiftId);
                             if (updateError) {
                                 console.error('FAILED TO UPDATE SHIFT STATUS:', updateError.message);
                             }
@@ -536,20 +909,21 @@ app.post('/api/bookings', async (req, res) => {
                             // (Exclude the new booking, as they just received the Confirmation template)
                             const previousBookings = allShiftBookings.filter(b => b.id !== booking.id);
                             for (const b of previousBookings) {
-                                const sub = formatEmail(paymentInvitationTemplate.subject, b.full_name, b.id);
-                                const msg = formatEmail(paymentInvitationTemplate.body, b.full_name, b.id);
+                                const sub = formatEmail(paymentInvitationTemplate.subject, b.full_name, b.id, false);
+                                const textMsg = formatEmail(paymentInvitationTemplate.body, b.full_name, b.id, false);
+                                const htmlMsg = formatEmail(paymentInvitationTemplate.body, b.full_name, b.id, true).replace(/\n/g, '<br>');
                                 try {
                                     await resend.emails.send({
                                         from: process.env.EMAIL_FROM || 'info@weekplore.gr',
                                         to: b.email,
                                         subject: sub,
-                                        text: msg,
-                                        html: msg.replace(/\n/g, '<br>'),
+                                        text: textMsg,
+                                        html: htmlMsg,
                                     });
                                     await supabase.from('email_logs').insert([{
                                             booking_id: b.id,
-                                            shift_id: formData.shiftId,
-                                            event_id: eventId,
+                                            shift_id: normalizedShiftId,
+                                            event_id: normalizedEventId,
                                             recipient_email: b.email,
                                             email_purpose: 'payment_invitation',
                                             status: 'sent',
@@ -572,7 +946,13 @@ app.post('/api/bookings', async (req, res) => {
     }
     catch (error) {
         console.error('Booking error:', error);
-        res.status(500).json({ error: error.message });
+        if (isDuplicateShiftEmailBookingError(error)) {
+            return res.status(409).json({ error: DUPLICATE_BOOKING_ERROR_MESSAGE });
+        }
+        res.status(500).json({ error: 'Failed to create booking. Please try again later.' });
+    }
+    finally {
+        activeBookingKeys.delete(bookingKey);
     }
 });
 app.patch('/api/admin/bookings/status', requireAdmin, async (req, res) => {
@@ -607,6 +987,44 @@ app.get('/api/admin/events', requireAdmin, async (req, res) => {
         ),
         products(*)
       `)
+            .order('created_at', { ascending: false });
+        if (error)
+            throw error;
+        if (data) {
+            data.forEach((event) => {
+                if (event.products) {
+                    event.products.sort((a, b) => (a.price || 0) - (b.price || 0));
+                }
+            });
+        }
+        res.json(data);
+    }
+    catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+app.get('/api/admin/private-events', requireAdmin, async (_req, res) => {
+    try {
+        const { data, error } = await supabase
+            .from('private_events')
+            .select('*')
+            .order('created_at', { ascending: false });
+        if (error)
+            throw error;
+        res.json(data);
+    }
+    catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+app.get('/api/admin/private-event-inquiries', requireAdmin, async (_req, res) => {
+    try {
+        const { data, error } = await supabase
+            .from('private_event_inquiries')
+            .select(`
+                *,
+                private_event_templates:private_event_template_id(name)
+            `)
             .order('created_at', { ascending: false });
         if (error)
             throw error;
@@ -754,6 +1172,67 @@ app.delete('/api/admin/events/:id', requireAdmin, async (req, res) => {
         }
         await supabase.from('products').delete().eq('event_id', eventId);
         const { error } = await supabase.from('events').delete().eq('id', eventId);
+        if (error)
+            throw error;
+        res.json({ success: true });
+    }
+    catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+app.post('/api/admin/private-events', requireAdmin, async (req, res) => {
+    try {
+        const safePrivateEvent = pickDefined(req.body || {}, [
+            'name',
+            'description',
+            'image_url',
+        ]);
+        if (!isNonEmptyString(safePrivateEvent.name)) {
+            return res.status(400).json({ error: 'Private event name is required.' });
+        }
+        const { data, error } = await supabase
+            .from('private_events')
+            .insert([safePrivateEvent])
+            .select()
+            .single();
+        if (error)
+            throw error;
+        res.json(data);
+    }
+    catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+app.put('/api/admin/private-events/:id', requireAdmin, async (req, res) => {
+    try {
+        const safePrivateEvent = pickDefined(req.body || {}, [
+            'name',
+            'description',
+            'image_url',
+        ]);
+        if (Object.keys(safePrivateEvent).length === 0) {
+            return res.status(400).json({ error: 'No valid private event fields provided.' });
+        }
+        const { data, error } = await supabase
+            .from('private_events')
+            .update(safePrivateEvent)
+            .eq('id', req.params.id)
+            .select()
+            .single();
+        if (error)
+            throw error;
+        res.json(data);
+    }
+    catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+app.delete('/api/admin/private-events/:id', requireAdmin, async (req, res) => {
+    try {
+        const { error } = await supabase
+            .from('private_events')
+            .delete()
+            .eq('id', req.params.id);
         if (error)
             throw error;
         res.json({ success: true });
@@ -914,12 +1393,13 @@ app.get('/api/reviews/visible', async (req, res) => {
 });
 app.post('/api/reviews', async (req, res) => {
     const safeReview = {
-        email: req.body?.email,
-        start: req.body?.start,
-        review: req.body?.review,
+        name: normalizeSingleLineText(req.body?.name, 120),
+        email: normalizeEmail(req.body?.email),
+        start: Number(req.body?.start),
+        review: normalizeMultilineText(req.body?.review, 2000),
         status: 'pending',
     };
-    if (!isNonEmptyString(safeReview.email) || !Number.isInteger(safeReview.start) || safeReview.start < 1 || safeReview.start > 5 || !isNonEmptyString(safeReview.review)) {
+    if (!isNonEmptyString(safeReview.name) || !EMAIL_REGEX.test(safeReview.email) || !Number.isInteger(safeReview.start) || safeReview.start < 1 || safeReview.start > 5 || !isNonEmptyString(safeReview.review)) {
         return res.status(400).json({ error: 'Invalid review payload.' });
     }
     try {
@@ -929,7 +1409,8 @@ app.post('/api/reviews', async (req, res) => {
         res.json(data);
     }
     catch (error) {
-        res.status(500).json({ error: error.message });
+        console.error('Review submission error:', error);
+        res.status(500).json({ error: 'Failed to submit review. Please try again later.' });
     }
 });
 app.patch('/api/admin/reviews/:id/status', requireAdmin, async (req, res) => {
