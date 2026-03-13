@@ -1053,7 +1053,7 @@ app.post('/api/bookings', bookingRateLimit, async (req, res) => {
                             // Mark as confirmed in DB
                             const { error: updateError } = await supabase
                                 .from('shifts')
-                                .update({ is_confirmed: true })
+                                .update({ is_confirmed: true, confirmed_at: new Date().toISOString() })
                                 .eq('id', normalizedShiftId);
 
                             if (updateError) {
@@ -1079,7 +1079,6 @@ app.post('/api/bookings', bookingRateLimit, async (req, res) => {
                                         text: textMsg,
                                         html: htmlMsg,
                                     });
-
                                     await supabase.from('email_logs').insert([{
                                         booking_id: b.id,
                                         shift_id: normalizedShiftId,
@@ -1324,6 +1323,74 @@ app.put('/api/admin/events/:id', requireAdmin, async (req, res) => {
     }
 });
 
+// PRODUCTS
+app.post('/api/admin/products', requireAdmin, async (req, res) => {
+    try {
+        const safeProductInfo = pickDefined(req.body || {}, [
+            'event_id',
+            'title',
+            'description',
+            'price',
+            'image_url',
+            'amount',
+        ]);
+
+        if (!safeProductInfo.event_id) {
+            return res.status(400).json({ error: 'Event ID is required for a product.' });
+        }
+
+        const { data, error } = await supabase.from('products').insert([safeProductInfo]).select().single();
+        if (error) throw error;
+        res.json(data);
+    } catch (error: any) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.put('/api/admin/products/:id', requireAdmin, async (req, res) => {
+    try {
+        const safeProductInfo = pickDefined(req.body || {}, [
+            'title',
+            'description',
+            'price',
+            'image_url',
+            'amount',
+        ]);
+
+        if (Object.keys(safeProductInfo).length === 0) {
+            return res.status(400).json({ error: 'No valid product fields provided.' });
+        }
+
+        const { data, error } = await supabase.from('products').update(safeProductInfo).eq('id', req.params.id).select().single();
+        if (error) throw error;
+        res.json(data);
+    } catch (error: any) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.delete('/api/admin/products/:id', requireAdmin, async (req, res) => {
+    try {
+        await supabase.from('booking_products').delete().eq('product_id', req.params.id);
+        const { error } = await supabase.from('products').delete().eq('id', req.params.id);
+        if (error) throw error;
+        res.json({ success: true });
+    } catch (error: any) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// REVIEWS
+app.get('/api/admin/reviews', requireAdmin, async (req, res) => {
+    try {
+        const { data, error } = await supabase.from('reviews').select('*').order('created_at', { ascending: false });
+        if (error) throw error;
+        res.json(data);
+    } catch (error: any) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
 app.delete('/api/admin/events/:id', requireAdmin, async (req, res) => {
     const eventId = req.params.id;
     try {
@@ -1444,7 +1511,8 @@ app.post('/api/admin/shifts', requireAdmin, async (req, res) => {
 
 app.put('/api/admin/shifts/:id', requireAdmin, async (req, res) => {
     try {
-        const safeShiftData = pickDefined(req.body || {}, [
+        const shiftId = req.params.id;
+        const updates: any = pickDefined(req.body || {}, [
             'start_time',
             'end_time',
             'capacity',
@@ -1454,11 +1522,24 @@ app.put('/api/admin/shifts/:id', requireAdmin, async (req, res) => {
             'is_active',
         ]);
 
-        if (Object.keys(safeShiftData).length === 0) {
+        if (Object.keys(updates).length === 0) {
             return res.status(400).json({ error: 'No valid shift fields provided.' });
         }
 
-        const { data, error } = await supabase.from('shifts').update(safeShiftData).eq('id', req.params.id).select().single();
+        // Handle confirmed_at logic
+        if (updates.is_confirmed === true) {
+            const { data: currentShift } = await supabase
+                .from('shifts')
+                .select('is_confirmed')
+                .eq('id', shiftId)
+                .single();
+
+            if (currentShift && !currentShift.is_confirmed) {
+                updates.confirmed_at = new Date().toISOString();
+            }
+        }
+
+        const { data, error } = await supabase.from('shifts').update(updates).eq('id', shiftId).select().single();
         if (error) throw error;
         res.json(data);
     } catch (error: any) {
@@ -1469,15 +1550,93 @@ app.put('/api/admin/shifts/:id', requireAdmin, async (req, res) => {
 app.delete('/api/admin/shifts/:id', requireAdmin, async (req, res) => {
     try {
         const shiftId = req.params.id;
-        const { data: bookings } = await supabase.from('bookings').select('id').eq('shift_id', shiftId);
-        if (bookings && bookings.length > 0) {
-            const bookingIds = bookings.map(b => b.id);
-            await supabase.from('booking_products').delete().in('booking_id', bookingIds);
-            await supabase.from('bookings').delete().in('id', bookingIds);
+        
+        // 1. Get shift and event info
+        const { data: shift, error: shiftErr } = await supabase
+            .from('shifts')
+            .select('*, events(id, title, location_name)')
+            .eq('id', shiftId)
+            .single();
+            
+        if (shiftErr || !shift) throw shiftErr || new Error('Shift not found');
+        const event = shift.events as any;
+
+        // 2. Fetch all bookings for this shift to notify
+        const { data: bookings } = await supabase
+            .from('bookings')
+            .select('*')
+            .eq('shift_id', shiftId);
+
+        // 3. Update shift and event status to canceled
+        await supabase.from('shifts').update({ status: 'canceled' }).eq('id', shiftId);
+        await supabase.from('events').update({ status: 'canceled' }).eq('id', event.id);
+
+        // 4. Send cancellation emails if template exists
+        if (bookings && bookings.length > 0 && process.env.RESEND_API_KEY) {
+            (async () => {
+                try {
+                    const { data: purposeData } = await supabase
+                        .from('email_purposes')
+                        .select('purpose, template_id, email_templates(*)')
+                        .eq('purpose', 'shift_cancelled')
+                        .single();
+
+                    const template = purposeData?.email_templates as any;
+                    if (template) {
+                        const dateStr = new Date(shift.start_time).toLocaleString('en-GB', {
+                            dateStyle: 'full',
+                            timeStyle: 'short'
+                        });
+
+                        for (const b of bookings) {
+                            const formatEmail = (text: string, isHtml = false) => {
+                                const safeName = isHtml ? escapeHtml(b.full_name) : b.full_name;
+                                const safeEventTitle = isHtml ? escapeHtml(event.title) : event.title;
+                                const safeDateStr = isHtml ? escapeHtml(dateStr) : dateStr;
+                                const safeLocation = isHtml ? escapeHtml(event.location_name || 'TBD') : event.location_name || 'TBD';
+                                
+                                return text
+                                    .replace(/{name}/g, safeName)
+                                    .replace(/{event}/g, safeEventTitle)
+                                    .replace(/{date}/g, safeDateStr)
+                                    .replace(/{location}/g, safeLocation)
+                                    .replace(/{people}/g, (b.number_of_people || 0).toString());
+                            };
+
+                            const subject = formatEmail(template.subject);
+                            const textBody = formatEmail(template.body);
+                            const htmlBody = formatEmail(template.body, true).replace(/\n/g, '<br>');
+
+                            try {
+                                await resend.emails.send({
+                                    from: process.env.EMAIL_FROM || 'info@weekplore.gr',
+                                    to: b.email,
+                                    subject: subject,
+                                    text: textBody,
+                                    html: htmlBody,
+                                });
+
+                                await supabase.from('email_logs').insert([{
+                                    booking_id: b.id,
+                                    shift_id: shiftId,
+                                    event_id: event.id,
+                                    recipient_email: b.email,
+                                    email_purpose: 'shift_cancelled',
+                                    status: 'sent',
+                                    template_id: template.id
+                                }]);
+                            } catch (err: any) {
+                                console.error(`Failed to send cancellation email to ${b.email}:`, err.message);
+                            }
+                        }
+                    }
+                } catch (emailErr: any) {
+                    console.error('Cancellation email automation error:', emailErr.message);
+                }
+            })();
         }
-        const { error } = await supabase.from('shifts').delete().eq('id', shiftId);
-        if (error) throw error;
-        res.json({ success: true });
+
+        res.json({ success: true, message: 'Shift canceled and notifications triggered.' });
     } catch (error: any) {
         res.status(500).json({ error: error.message });
     }
@@ -1498,7 +1657,6 @@ app.post('/api/admin/products', requireAdmin, async (req, res) => {
         if (!safeProductInfo.event_id || !isNonEmptyString(safeProductInfo.title)) {
             return res.status(400).json({ error: 'Missing required product information.' });
         }
-
         const { data, error } = await supabase.from('products').insert([safeProductInfo]).select().single();
         if (error) throw error;
         res.json(data);
