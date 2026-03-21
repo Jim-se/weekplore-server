@@ -869,7 +869,7 @@ app.get('/api/private-events', async (_req, res) => {
             .order('created_at', { ascending: false });
 
         if (error) throw error;
-        res.json(data);
+        res.json((data || []).filter((privateEvent: any) => privateEvent?.is_visible !== false));
     } catch (error: any) {
         res.status(500).json({ error: error.message });
     }
@@ -1835,10 +1835,19 @@ app.post('/api/admin/private-events', requireAdmin, async (req, res) => {
             'name',
             'description',
             'image_url',
+            'is_visible',
         ]);
+
+        if (safePrivateEvent.is_visible === undefined) {
+            safePrivateEvent.is_visible = true;
+        }
 
         if (!isNonEmptyString(safePrivateEvent.name)) {
             return res.status(400).json({ error: 'Private event name is required.' });
+        }
+
+        if (typeof safePrivateEvent.is_visible !== 'boolean') {
+            return res.status(400).json({ error: 'Private event visibility must be a boolean.' });
         }
 
         const { data, error } = await supabase
@@ -1860,10 +1869,15 @@ app.put('/api/admin/private-events/:id', requireAdmin, async (req, res) => {
             'name',
             'description',
             'image_url',
+            'is_visible',
         ]);
 
         if (Object.keys(safePrivateEvent).length === 0) {
             return res.status(400).json({ error: 'No valid private event fields provided.' });
+        }
+
+        if (safePrivateEvent.is_visible !== undefined && typeof safePrivateEvent.is_visible !== 'boolean') {
+            return res.status(400).json({ error: 'Private event visibility must be a boolean.' });
         }
 
         const { data, error } = await supabase
@@ -1882,13 +1896,45 @@ app.put('/api/admin/private-events/:id', requireAdmin, async (req, res) => {
 
 app.delete('/api/admin/private-events/:id', requireAdmin, async (req, res) => {
     try {
-        const { error } = await supabase
+        const privateEventId = normalizeSingleLineText(req.params.id, 64);
+
+        if (!privateEventId) {
+            return res.status(400).json({ error: 'Invalid private event id.' });
+        }
+
+        const { count: linkedInquiryCount, error: linkedInquiryCountError } = await supabase
+            .from('private_event_inquiries')
+            .select('id', { count: 'exact', head: true })
+            .eq('private_event_template_id', privateEventId);
+
+        if (linkedInquiryCountError) throw linkedInquiryCountError;
+
+        if ((linkedInquiryCount || 0) > 0) {
+            const { error: detachInquiryError } = await supabase
+                .from('private_event_inquiries')
+                .update({ private_event_template_id: null })
+                .eq('private_event_template_id', privateEventId);
+
+            if (detachInquiryError) throw detachInquiryError;
+        }
+
+        const { data, error } = await supabase
             .from('private_events')
             .delete()
-            .eq('id', req.params.id);
+            .eq('id', privateEventId)
+            .select('id')
+            .maybeSingle();
 
         if (error) throw error;
-        res.json({ success: true });
+
+        if (!data) {
+            return res.status(404).json({ error: 'Private event not found.' });
+        }
+
+        res.json({
+            success: true,
+            detachedInquiryCount: linkedInquiryCount || 0
+        });
     } catch (error: any) {
         res.status(500).json({ error: error.message });
     }
