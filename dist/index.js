@@ -361,6 +361,7 @@ const generateCancelToken = (bookingId) => {
 };
 const buildCancelBookingPath = (bookingId, token) => `${CANCEL_BOOKING_ROUTE}/${encodeURIComponent(String(bookingId))}?token=${encodeURIComponent(token)}`;
 const buildCancelBookingUrl = (bookingId, token) => `${SERVER_URL}${buildCancelBookingPath(bookingId, token)}`;
+const formatBookingReference = (bookingId) => `WKP-${String(bookingId).padStart(6, '0')}`;
 const verifyCancelToken = (bookingId, token) => {
     const expected = generateCancelToken(bookingId);
     try {
@@ -387,6 +388,7 @@ const cancelPageHtml = (bookingName, eventTitle, bookingId, token) => `
     h1 { font-size: 28px; margin-bottom: 8px; }
     .name { color: #1a1a1a; font-weight: bold; }
     p { color: #666; font-family: sans-serif; font-size: 14px; line-height: 1.6; margin-bottom: 8px; }
+    .reference { display: inline-block; margin: 16px 0 0; padding: 8px 14px; border-radius: 999px; background: #f4efe7; color: #1a1a1a; font-family: sans-serif; font-size: 11px; font-weight: 700; letter-spacing: 1.5px; }
     .event { font-weight: bold; color: #1a1a1a; }
     .warning { background: #fff4f0; border-radius: 12px; padding: 16px; margin: 24px 0; font-size: 13px; color: #c0392b; font-family: sans-serif; }
     form { margin-top: 32px; }
@@ -403,6 +405,7 @@ const cancelPageHtml = (bookingName, eventTitle, bookingId, token) => `
     <h1>Are you sure, <span class="name">${escapeHtml(bookingName.split(' ')[0] || 'there')}?</span></h1>
     <p style="margin-top: 16px;">You are about to cancel your booking for</p>
     <p class="event">${escapeHtml(eventTitle)}</p>
+    <div class="reference">Booking Reference: ${escapeHtml(formatBookingReference(bookingId))}</div>
     <div class="warning">This action is permanent and cannot be undone.</div>
     <form method="POST" action="${buildCancelBookingPath(bookingId, token)}">
       <button type="submit" class="btn-cancel">Yes, Cancel My Booking</button>
@@ -413,7 +416,7 @@ const cancelPageHtml = (bookingName, eventTitle, bookingId, token) => `
 </body>
 </html>
 `;
-const cancelSuccessHtml = (bookingName, eventTitle) => `
+const cancelSuccessHtml = (bookingName, eventTitle, bookingId) => `
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -428,6 +431,7 @@ const cancelSuccessHtml = (bookingName, eventTitle) => `
     .label { font-size: 10px; letter-spacing: 4px; text-transform: uppercase; color: #27ae60; font-family: sans-serif; font-weight: 700; margin-bottom: 12px; }
     h1 { font-size: 28px; margin-bottom: 16px; }
     p { color: #666; font-family: sans-serif; font-size: 14px; line-height: 1.6; margin-bottom: 8px; }
+    .reference { display: inline-block; margin: 12px 0 16px; padding: 8px 14px; border-radius: 999px; background: #eef8f1; color: #1a1a1a; font-family: sans-serif; font-size: 11px; font-weight: 700; letter-spacing: 1.5px; }
     .event { font-weight: bold; color: #1a1a1a; }
     .btn-home { display: inline-block; margin-top: 32px; padding: 16px 40px; background: #1a1a1a; color: white; border-radius: 99px; font-size: 11px; font-weight: 700; letter-spacing: 3px; text-transform: uppercase; font-family: sans-serif; text-decoration: none; }
     .footer { margin-top: 24px; font-size: 11px; color: #aaa; font-family: sans-serif; }
@@ -438,6 +442,7 @@ const cancelSuccessHtml = (bookingName, eventTitle) => `
     <div class="icon">✓</div>
     <div class="label">Cancellation Confirmed</div>
     <h1>Done, ${escapeHtml(bookingName.split(' ')[0] || 'there')}.</h1>
+    <div class="reference">Booking Reference: ${escapeHtml(formatBookingReference(bookingId))}</div>
     <p>Your booking for <span class="event">${escapeHtml(eventTitle)}</span> has been successfully cancelled.</p>
     <p>We hope to see you at a future Weekplore experience.</p>
     <a href="/" class="btn-home">Back to Weekplore</a>
@@ -503,12 +508,15 @@ const sendShiftCancelledEmails = async ({ event, shift, bookings, template, }) =
             const safeLocation = isHtml
                 ? escapeHtml(event.location_name || 'TBD')
                 : event.location_name || 'TBD';
+            const bookingReference = formatBookingReference(booking.id);
+            const safeBookingReference = isHtml ? escapeHtml(bookingReference) : bookingReference;
             return text
                 .replace(/{name}/g, safeName)
                 .replace(/{event}/g, safeEventTitle)
                 .replace(/{date}/g, safeDateStr)
                 .replace(/{location}/g, safeLocation)
-                .replace(/{people}/g, (booking.number_of_people || 0).toString());
+                .replace(/{people}/g, (booking.number_of_people || 0).toString())
+                .replace(/{booking_reference}/g, safeBookingReference);
         };
         const subject = formatEmail(localizedSubject);
         const textBody = formatEmail(localizedBody);
@@ -702,7 +710,7 @@ app.post('/api/cancel-booking/:id', async (req, res) => {
         const { error: deleteError } = await supabase.from('bookings').delete().eq('id', id);
         if (deleteError)
             throw deleteError;
-        return res.send(cancelSuccessHtml(booking.full_name, eventTitle));
+        return res.send(cancelSuccessHtml(booking.full_name, eventTitle, id));
     }
     catch (err) {
         return res.status(500).send(cancelErrorHtml('Failed to cancel your booking. Please contact us directly.'));
@@ -917,6 +925,7 @@ app.post('/api/private-event-inquiries', async (req, res) => {
                             .replace(/{date}/g, safeDateStr)
                             .replace(/{location}/g, safeLocationStr)
                             .replace(/{people}/g, peopleStr)
+                            .replace(/{booking_reference}/g, '-')
                             .replace(/{cancel_url}/g, '#');
                         return isHtml ? formattedText.replace(/\n/g, '<br>') : formattedText;
                     };
@@ -1054,18 +1063,6 @@ app.post('/api/bookings', bookingRateLimit, async (req, res) => {
         }
         if (shift.is_full) {
             return res.status(400).json({ error: 'This shift is already full.' });
-        }
-        failureStage = 'check_duplicate_booking';
-        const { data: duplicateBookings, error: duplicateBookingsError } = await supabase
-            .from('bookings')
-            .select('id')
-            .eq('shift_id', normalizedShiftId)
-            .ilike('email', normalizedEmail)
-            .limit(1);
-        if (duplicateBookingsError)
-            throw duplicateBookingsError;
-        if ((duplicateBookings || []).length > 0) {
-            return res.status(409).json({ error: DUPLICATE_BOOKING_ERROR_MESSAGE });
         }
         failureStage = 'check_shift_capacity';
         const { data: existingBookings, error: bookingsErr } = await supabase
@@ -1232,6 +1229,8 @@ app.post('/api/bookings', bookingRateLimit, async (req, res) => {
                         const priceText = billAmount == null ? '0' : String(billAmount);
                         const safePrice = isHtml ? escapeHtml(priceText) : priceText;
                         const normalizedPeopleCount = Number.isFinite(peopleCount) ? peopleCount : 0;
+                        const bookingReference = formatBookingReference(bookingId);
+                        const safeBookingReference = isHtml ? escapeHtml(bookingReference) : bookingReference;
                         const cancelLink = isHtml
                             ? `<a href="${cancelUrl}" style="color: #c0392b; font-weight: bold; text-decoration: underline;">Cancel Reservation</a>`
                             : cancelUrl;
@@ -1242,6 +1241,7 @@ app.post('/api/bookings', bookingRateLimit, async (req, res) => {
                             .replace(/{location}/g, safeLocationName)
                             .replace(/{price}/g, safePrice)
                             .replace(/{people}/g, normalizedPeopleCount.toString())
+                            .replace(/{booking_reference}/g, safeBookingReference)
                             .replace(/{cancel_url}/g, cancelLink);
                     };
                     const sendTemplateEmail = async ({ recipientEmail, recipientName, bookingId, peopleCount, billAmount, template, purpose, language, }) => {
