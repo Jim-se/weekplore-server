@@ -17,9 +17,27 @@ const adminEmailAllowlist = (process.env.ADMIN_EMAILS || '')
     .split(',')
     .map((email) => email.trim().toLowerCase())
     .filter(Boolean);
-const allowedCorsOrigins = (process.env.CORS_ALLOWED_ORIGINS || 'http://localhost:3000,http://127.0.0.1:3000,http://weekplore.gr,https://weekplore.gr,http://www.weekplore.gr,https://www.weekplore.gr')
+const defaultCorsAllowedOrigins = [
+    'http://localhost:3000',
+    'http://127.0.0.1:3000',
+    'http://localhost:5173',
+    'http://127.0.0.1:5173',
+    'http://weekplore.gr',
+    'https://weekplore.gr',
+    'http://www.weekplore.gr',
+    'https://www.weekplore.gr',
+    'https://weekplore.vercel.app'
+];
+const defaultCorsAllowedOriginPatterns = [
+    'https://weekplore-*.vercel.app'
+];
+const allowedCorsOrigins = (process.env.CORS_ALLOWED_ORIGINS || defaultCorsAllowedOrigins.join(','))
     .split(',')
     .map((origin) => origin.trim())
+    .filter(Boolean);
+const allowedCorsOriginPatterns = (process.env.CORS_ALLOWED_ORIGIN_PATTERNS || defaultCorsAllowedOriginPatterns.join(','))
+    .split(',')
+    .map((pattern) => pattern.trim())
     .filter(Boolean);
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const CONTROL_CHAR_REGEX = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g;
@@ -28,6 +46,7 @@ const BOOKING_RATE_LIMIT_WINDOW_MS = 10 * 60 * 1000;
 const BOOKING_RATE_LIMIT_MAX_REQUESTS = 5;
 const BOOKING_RATE_LIMIT_CLEANUP_EVERY = 100;
 const DUPLICATE_BOOKING_ERROR_MESSAGE = 'This email already has a booking for this time slot. If you need to make a change, please contact us.';
+const GENERIC_BOOKING_ERROR_MESSAGE = 'Failed to create booking. Please try again later.';
 const DUPLICATE_BOOKING_CONSTRAINT = 'bookings_unique_shift_email_idx';
 const ARCHIVED_STATUSES = new Set(['archived', 'canceled', 'cancelled']);
 const EMAIL_TEMPLATE_FIELDS = ['subject_eng', 'body_eng', 'subject_el', 'body_el'];
@@ -57,6 +76,11 @@ const toArchiveStatus = (value, fallback = 'archived') => {
     return fallback;
 };
 const isPlainObject = (value) => typeof value === 'object' && value !== null && Object.getPrototypeOf(value) === Object.prototype;
+const escapeRegex = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const wildcardPatternToRegex = (pattern) => new RegExp(`^${escapeRegex(pattern).replace(/\\\*/g, '.*')}$`, 'i');
+const corsOriginPatternMatchers = allowedCorsOriginPatterns.map((pattern) => wildcardPatternToRegex(pattern));
+const isAllowedCorsOrigin = (origin) => allowedCorsOrigins.includes(origin) ||
+    corsOriginPatternMatchers.some((pattern) => pattern.test(origin));
 const sanitizeStringInput = (value, options = {}) => {
     const { lowercase = false, maxLength = 5000, preserveNewlines = true } = options;
     const normalizedLineBreaks = value.replace(/\r\n/g, '\n');
@@ -165,6 +189,75 @@ const isDuplicateShiftEmailBookingError = (error) => {
         searchableText.includes('(shift_id, lower(email))') ||
         searchableText.includes('lower(email)');
 };
+const isShiftCapacityBookingError = (error) => {
+    const candidate = error;
+    if (!candidate) {
+        return false;
+    }
+    const searchableText = [candidate.message, candidate.details, candidate.hint]
+        .filter((value) => typeof value === 'string')
+        .join(' ')
+        .toLowerCase();
+    if (!searchableText) {
+        return false;
+    }
+    const looksLikeCapacityError = (searchableText.includes('capacity') ||
+        searchableText.includes('full') ||
+        searchableText.includes('spots remaining') ||
+        searchableText.includes('no spots') ||
+        searchableText.includes('overbook') ||
+        searchableText.includes('booked_spots'));
+    return looksLikeCapacityError && (candidate.code === 'P0001' ||
+        candidate.code === '23514' ||
+        candidate.code === '22000' ||
+        candidate.code === undefined);
+};
+const isInvalidBookingProductError = (error) => {
+    const candidate = error;
+    if (!candidate) {
+        return false;
+    }
+    const searchableText = [candidate.message, candidate.details, candidate.hint]
+        .filter((value) => typeof value === 'string')
+        .join(' ')
+        .toLowerCase();
+    return candidate.code === '23503' && (searchableText.includes('booking_products') ||
+        searchableText.includes('product_id'));
+};
+const maskEmailForLogs = (email) => {
+    if (!email || !email.includes('@')) {
+        return email || null;
+    }
+    const [localPart, domainPart] = email.split('@');
+    const safeLocalPart = localPart.length <= 2
+        ? `${localPart.charAt(0) || '*'}*`
+        : `${localPart.slice(0, 2)}***`;
+    return `${safeLocalPart}@${domainPart}`;
+};
+const summarizeBookingProductsForLogs = (products) => products.map((product) => ({
+    product_id: isNonEmptyString(product?.product_id) ? String(product.product_id) : null,
+    quantity: Number.isInteger(product?.quantity) ? product.quantity : null
+}));
+const serializeErrorForLogs = (error) => {
+    if (error instanceof Error) {
+        return {
+            name: error.name,
+            message: error.message,
+            stack: error.stack
+        };
+    }
+    if (typeof error === 'object' && error !== null) {
+        const candidate = error;
+        return {
+            code: typeof candidate.code === 'string' ? candidate.code : undefined,
+            message: typeof candidate.message === 'string' ? candidate.message : undefined,
+            details: typeof candidate.details === 'string' ? candidate.details : undefined,
+            hint: typeof candidate.hint === 'string' ? candidate.hint : undefined,
+            stack: typeof candidate.stack === 'string' ? candidate.stack : undefined
+        };
+    }
+    return { message: String(error) };
+};
 const getClientIp = (req) => req.ip || req.socket.remoteAddress || 'unknown';
 const pruneRateLimitStore = (now) => {
     for (const [ip, timestamps] of bookingRateLimitStore.entries()) {
@@ -197,7 +290,7 @@ const bookingRateLimit = (req, res, next) => {
 app.use(cors({
     origin(origin, callback) {
         // If no origin (like mobile apps or curl requests) or origin is in the allowlist
-        if (!origin || allowedCorsOrigins.includes(origin)) {
+        if (!origin || isAllowedCorsOrigin(origin)) {
             return callback(null, true);
         }
         console.error(`CORS blocked for origin: ${origin}`);
@@ -487,7 +580,7 @@ const archiveShiftAndNotify = async (shiftId, status = 'archived', extraUpdates 
     }
     return updatedShift;
 };
-const archiveEventAndNotify = async (eventId, status = 'archived', extraUpdates = {}) => {
+const archiveEventAndNotify = async (eventId, status = 'archived', extraUpdates = {}, options = {}) => {
     const { data: event, error: eventErr } = await supabase
         .from('events')
         .select('*')
@@ -497,6 +590,7 @@ const archiveEventAndNotify = async (eventId, status = 'archived', extraUpdates 
         throw eventErr || new Error('Event not found');
     }
     const archiveStatus = toArchiveStatus(status);
+    const shouldSendCancellationEmails = options.sendCancellationEmails !== false;
     const { data: shifts, error: shiftsError } = await supabase
         .from('shifts')
         .select('*')
@@ -507,7 +601,7 @@ const archiveEventAndNotify = async (eventId, status = 'archived', extraUpdates 
     const shiftsToNotify = (shifts || []).filter((shift) => !isArchivedStatus(shift.status));
     const shiftIdsToNotify = shiftsToNotify.map((shift) => shift.id);
     const bookingsByShift = new Map();
-    if (shiftIdsToNotify.length > 0) {
+    if (shouldSendCancellationEmails && shiftIdsToNotify.length > 0) {
         const { data: bookings, error: bookingsError } = await supabase
             .from('bookings')
             .select('*')
@@ -545,7 +639,7 @@ const archiveEventAndNotify = async (eventId, status = 'archived', extraUpdates 
             throw updateShiftsError;
         }
     }
-    if (shiftsToNotify.length > 0) {
+    if (shouldSendCancellationEmails && shiftsToNotify.length > 0) {
         const template = await getShiftCancelledTemplate();
         for (const shift of shiftsToNotify) {
             const bookings = bookingsByShift.get(shift.id) || [];
@@ -892,6 +986,14 @@ app.post('/api/bookings', bookingRateLimit, async (req, res) => {
     const normalizedPhone = normalizePhone(formData?.phone);
     const normalizedEmailLanguage = normalizeEmailLanguage(formData?.email_language);
     const selectedProducts = Array.isArray(formData?.products) ? formData.products : [];
+    const bookingAttemptId = crypto.randomUUID();
+    const requestOrigin = typeof req.headers.origin === 'string' ? req.headers.origin : null;
+    const requestReferer = typeof req.headers.referer === 'string' ? req.headers.referer : null;
+    const requestUserAgent = typeof req.headers['user-agent'] === 'string' ? req.headers['user-agent'] : null;
+    let failureStage = 'validate_request';
+    let observedCapacity = null;
+    let observedCurrentTotal = null;
+    let observedRemainingSpots = null;
     // --- 1. SERVER-SIDE VALIDATION & CAPACITY CHECKS ---
     if (!Number.isInteger(normalizedEventId) ||
         normalizedEventId < 1 ||
@@ -916,6 +1018,7 @@ app.post('/api/bookings', bookingRateLimit, async (req, res) => {
     activeBookingKeys.add(bookingKey);
     try {
         let productTotal = 0;
+        failureStage = 'load_event';
         const { data: event, error: eventError } = await supabase
             .from('events')
             .select('id, price, is_hidden, is_sold_out, booking_deadline, status')
@@ -934,6 +1037,7 @@ app.post('/api/bookings', bookingRateLimit, async (req, res) => {
             }
         }
         // Verify Event and Shift relationship + fetch shift status
+        failureStage = 'load_shift';
         const { data: shift, error: fetchShiftError } = await supabase
             .from('shifts')
             .select('id, event_id, people_counter, capacity, is_active, is_full, start_time, is_confirmed, status')
@@ -951,6 +1055,7 @@ app.post('/api/bookings', bookingRateLimit, async (req, res) => {
         if (shift.is_full) {
             return res.status(400).json({ error: 'This shift is already full.' });
         }
+        failureStage = 'check_duplicate_booking';
         const { data: duplicateBookings, error: duplicateBookingsError } = await supabase
             .from('bookings')
             .select('id')
@@ -962,6 +1067,7 @@ app.post('/api/bookings', bookingRateLimit, async (req, res) => {
         if ((duplicateBookings || []).length > 0) {
             return res.status(409).json({ error: DUPLICATE_BOOKING_ERROR_MESSAGE });
         }
+        failureStage = 'check_shift_capacity';
         const { data: existingBookings, error: bookingsErr } = await supabase
             .from('bookings')
             .select('number_of_people')
@@ -969,11 +1075,17 @@ app.post('/api/bookings', bookingRateLimit, async (req, res) => {
         if (bookingsErr)
             throw bookingsErr;
         const currentTotal = (existingBookings || []).reduce((sum, booking) => sum + (booking.number_of_people || 0), 0);
+        observedCapacity = typeof shift.capacity === 'number' ? shift.capacity : null;
+        observedCurrentTotal = currentTotal;
+        observedRemainingSpots = observedCapacity && observedCapacity > 0
+            ? Math.max(observedCapacity - currentTotal, 0)
+            : null;
         if (typeof shift.capacity === 'number' && shift.capacity > 0 && currentTotal + normalizedPeople > shift.capacity) {
             return res.status(400).json({
                 error: `Sorry, only ${Math.max(shift.capacity - currentTotal, 0)} spots remaining for this experience.`
             });
         }
+        failureStage = 'load_product_categories';
         const { data: eventProductCategories, error: eventProductCategoriesError } = await supabase
             .from('product_categories')
             .select(`
@@ -1031,6 +1143,7 @@ app.post('/api/bookings', bookingRateLimit, async (req, res) => {
         }
         const totalBill = ((Number(event.price) || 0) * normalizedPeople) + productTotal;
         // --- 2. Insert booking into Supabase ---
+        failureStage = 'insert_booking';
         const { data: booking, error: bookingError } = await supabase
             .from('bookings')
             .insert([
@@ -1056,6 +1169,7 @@ app.post('/api/bookings', bookingRateLimit, async (req, res) => {
         }
         // --- 3. Insert booking products if any ---
         if (selectedProducts.length > 0) {
+            failureStage = 'insert_booking_products';
             const bookingProducts = selectedProducts.map((p) => ({
                 booking_id: booking.id,
                 product_id: p.product_id,
@@ -1084,6 +1198,7 @@ app.post('/api/bookings', bookingRateLimit, async (req, res) => {
             }
         }
         // --- 4. Email Logic (Run asynchronously so it doesn't block the response) ---
+        failureStage = 'send_booking_response';
         if (process.env.RESEND_API_KEY) {
             (async () => {
                 try {
@@ -1238,11 +1353,33 @@ app.post('/api/bookings', bookingRateLimit, async (req, res) => {
         res.json(booking);
     }
     catch (error) {
-        console.error('Booking error:', error);
+        console.error('Booking error:', {
+            bookingAttemptId,
+            stage: failureStage,
+            eventId: normalizedEventId,
+            shiftId: normalizedShiftId,
+            numberOfPeople: normalizedPeople,
+            selectedProducts: summarizeBookingProductsForLogs(selectedProducts),
+            email: maskEmailForLogs(normalizedEmail),
+            origin: requestOrigin,
+            referer: requestReferer,
+            ip: getClientIp(req),
+            userAgent: requestUserAgent,
+            observedCapacity,
+            observedCurrentTotal,
+            observedRemainingSpots,
+            error: serializeErrorForLogs(error)
+        });
         if (isDuplicateShiftEmailBookingError(error)) {
             return res.status(409).json({ error: DUPLICATE_BOOKING_ERROR_MESSAGE });
         }
-        res.status(500).json({ error: 'Failed to create booking. Please try again later.' });
+        if (isShiftCapacityBookingError(error)) {
+            return res.status(400).json({ error: 'This shift is already full.' });
+        }
+        if (isInvalidBookingProductError(error)) {
+            return res.status(400).json({ error: 'Invalid product selected.' });
+        }
+        res.status(500).json({ error: GENERIC_BOOKING_ERROR_MESSAGE });
     }
     finally {
         activeBookingKeys.delete(bookingKey);
@@ -1476,7 +1613,13 @@ app.put('/api/admin/events/:id', requireAdmin, async (req, res) => {
         }
         if (isArchivedStatus(safeEventData.status)) {
             const { status, ...otherUpdates } = safeEventData;
-            const data = await archiveEventAndNotify(req.params.id, status, otherUpdates);
+            const sendCancellationEmails = req.body?.sendCancellationEmails;
+            if (sendCancellationEmails !== undefined && typeof sendCancellationEmails !== 'boolean') {
+                return res.status(400).json({ error: 'sendCancellationEmails must be a boolean.' });
+            }
+            const data = await archiveEventAndNotify(req.params.id, status, otherUpdates, {
+                sendCancellationEmails,
+            });
             return res.json(data);
         }
         const { data, error } = await supabase
@@ -1495,8 +1638,189 @@ app.put('/api/admin/events/:id', requireAdmin, async (req, res) => {
 });
 app.delete('/api/admin/events/:id', requireAdmin, async (req, res) => {
     try {
-        const data = await archiveEventAndNotify(req.params.id, 'archived');
-        res.json({ success: true, message: 'Event archived and notifications triggered.', event: data });
+        const sendCancellationEmails = req.body?.sendCancellationEmails;
+        if (sendCancellationEmails !== undefined && typeof sendCancellationEmails !== 'boolean') {
+            return res.status(400).json({ error: 'sendCancellationEmails must be a boolean.' });
+        }
+        const data = await archiveEventAndNotify(req.params.id, 'archived', {}, {
+            sendCancellationEmails,
+        });
+        res.json({
+            success: true,
+            message: sendCancellationEmails === false
+                ? 'Event archived without sending cancellation emails.'
+                : 'Event archived and cancellation notifications triggered.',
+            event: data
+        });
+    }
+    catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+app.post('/api/admin/events/:id/images', requireAdmin, async (req, res) => {
+    try {
+        const eventId = Number(req.params.id);
+        const imageUrl = normalizeSingleLineText(req.body?.image_url, 2048);
+        const makeCover = req.body?.make_cover === true;
+        if (!Number.isInteger(eventId)) {
+            return res.status(400).json({ error: 'Invalid event id.' });
+        }
+        if (!imageUrl) {
+            return res.status(400).json({ error: 'Event image URL is required.' });
+        }
+        const { data: existingImages, error: existingImagesError } = await supabase
+            .from('event_images')
+            .select('id')
+            .eq('event_id', eventId);
+        if (existingImagesError)
+            throw existingImagesError;
+        const shouldMakeCover = makeCover || (existingImages || []).length === 0;
+        if (shouldMakeCover) {
+            const { error: resetCoverError } = await supabase
+                .from('event_images')
+                .update({ is_cover: false })
+                .eq('event_id', eventId);
+            if (resetCoverError)
+                throw resetCoverError;
+        }
+        const { data, error } = await supabase
+            .from('event_images')
+            .insert([{
+                event_id: eventId,
+                image_url: imageUrl,
+                is_cover: shouldMakeCover,
+            }])
+            .select()
+            .single();
+        if (error)
+            throw error;
+        if (shouldMakeCover) {
+            const { error: updateEventError } = await supabase
+                .from('events')
+                .update({ cover_image_url: imageUrl })
+                .eq('id', eventId);
+            if (updateEventError)
+                throw updateEventError;
+        }
+        res.json(data);
+    }
+    catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+app.put('/api/admin/events/:id/cover-image', requireAdmin, async (req, res) => {
+    try {
+        const eventId = Number(req.params.id);
+        const imageUrl = normalizeSingleLineText(req.body?.image_url, 2048);
+        if (!Number.isInteger(eventId)) {
+            return res.status(400).json({ error: 'Invalid event id.' });
+        }
+        if (!imageUrl) {
+            return res.status(400).json({ error: 'Event image URL is required.' });
+        }
+        const { error: resetCoverError } = await supabase
+            .from('event_images')
+            .update({ is_cover: false })
+            .eq('event_id', eventId);
+        if (resetCoverError)
+            throw resetCoverError;
+        const { data: existingImage, error: existingImageError } = await supabase
+            .from('event_images')
+            .select('id')
+            .eq('event_id', eventId)
+            .eq('image_url', imageUrl)
+            .maybeSingle();
+        if (existingImageError)
+            throw existingImageError;
+        if (existingImage) {
+            const { error: markCoverError } = await supabase
+                .from('event_images')
+                .update({ is_cover: true })
+                .eq('id', existingImage.id);
+            if (markCoverError)
+                throw markCoverError;
+        }
+        else {
+            const { error: insertImageError } = await supabase
+                .from('event_images')
+                .insert([{
+                    event_id: eventId,
+                    image_url: imageUrl,
+                    is_cover: true,
+                }]);
+            if (insertImageError)
+                throw insertImageError;
+        }
+        const { error: updateEventError } = await supabase
+            .from('events')
+            .update({ cover_image_url: imageUrl })
+            .eq('id', eventId);
+        if (updateEventError)
+            throw updateEventError;
+        res.json({ success: true });
+    }
+    catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+app.delete('/api/admin/event-images/:id', requireAdmin, async (req, res) => {
+    try {
+        const imageId = Number(req.params.id);
+        if (!Number.isInteger(imageId)) {
+            return res.status(400).json({ error: 'Invalid event image id.' });
+        }
+        const { data: imageRecord, error: imageRecordError } = await supabase
+            .from('event_images')
+            .select('id, event_id, image_url, is_cover')
+            .eq('id', imageId)
+            .single();
+        if (imageRecordError || !imageRecord) {
+            return res.status(404).json({ error: 'Event image not found.' });
+        }
+        const { error: deleteImageError } = await supabase
+            .from('event_images')
+            .delete()
+            .eq('id', imageId);
+        if (deleteImageError)
+            throw deleteImageError;
+        const { data: remainingImages, error: remainingImagesError } = await supabase
+            .from('event_images')
+            .select('id, image_url')
+            .eq('event_id', imageRecord.event_id)
+            .order('id', { ascending: true });
+        if (remainingImagesError)
+            throw remainingImagesError;
+        if ((remainingImages || []).length === 0) {
+            const { error: clearCoverError } = await supabase
+                .from('events')
+                .update({ cover_image_url: '' })
+                .eq('id', imageRecord.event_id);
+            if (clearCoverError)
+                throw clearCoverError;
+            return res.json({ success: true });
+        }
+        if (imageRecord.is_cover) {
+            const nextCoverImage = remainingImages?.[0];
+            const { error: resetRemainingCoverError } = await supabase
+                .from('event_images')
+                .update({ is_cover: false })
+                .eq('event_id', imageRecord.event_id);
+            if (resetRemainingCoverError)
+                throw resetRemainingCoverError;
+            const { error: setNextCoverError } = await supabase
+                .from('event_images')
+                .update({ is_cover: true })
+                .eq('id', nextCoverImage.id);
+            if (setNextCoverError)
+                throw setNextCoverError;
+            const { error: updateEventError } = await supabase
+                .from('events')
+                .update({ cover_image_url: nextCoverImage.image_url })
+                .eq('id', imageRecord.event_id);
+            if (updateEventError)
+                throw updateEventError;
+        }
+        res.json({ success: true });
     }
     catch (error) {
         res.status(500).json({ error: error.message });
