@@ -1413,7 +1413,17 @@ app.get('/api/admin/events', requireAdmin, async (req, res) => {
         *,
         shifts(
           *,
-          bookings(*)
+          bookings(
+            *,
+            booking_products(
+              product_id,
+              quantity,
+              products(
+                id,
+                title
+              )
+            )
+          )
         ),
         product_categories(
           *,
