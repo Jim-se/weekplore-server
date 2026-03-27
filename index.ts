@@ -53,6 +53,7 @@ const DUPLICATE_BOOKING_ERROR_MESSAGE = 'This email already has a booking for th
 const GENERIC_BOOKING_ERROR_MESSAGE = 'Failed to create booking. Please try again later.';
 const DUPLICATE_BOOKING_CONSTRAINT = 'bookings_unique_shift_email_idx';
 const ARCHIVED_STATUSES = new Set(['archived', 'canceled', 'cancelled']);
+const CANCELED_BOOKING_STATUSES = new Set(['canceled', 'cancelled']);
 const EMAIL_TEMPLATE_FIELDS = ['subject_eng', 'body_eng', 'subject_el', 'body_el'];
 const bookingRateLimitStore = new Map<string, number[]>();
 const activeBookingKeys = new Set<string>();
@@ -78,6 +79,9 @@ const normalizeLifecycleStatus = (value: unknown) =>
 
 const isArchivedStatus = (value: unknown) =>
     typeof value === 'string' && ARCHIVED_STATUSES.has(normalizeLifecycleStatus(value));
+
+const isCanceledBookingStatus = (value: unknown) =>
+    typeof value === 'string' && CANCELED_BOOKING_STATUSES.has(normalizeLifecycleStatus(value));
 
 const toArchiveStatus = (value: unknown, fallback = 'archived') => {
     const normalized = normalizeLifecycleStatus(value);
@@ -729,7 +733,7 @@ const archiveShiftAndNotify = async (
             throw bookingsError;
         }
 
-        bookings = bookingRows || [];
+        bookings = (bookingRows || []).filter((booking) => !isCanceledBookingStatus(booking.status));
     }
 
     const { data: updatedShift, error: updateError } = await supabase
@@ -800,6 +804,10 @@ const archiveEventAndNotify = async (
         }
 
         for (const booking of bookings || []) {
+            if (isCanceledBookingStatus(booking.status)) {
+                continue;
+            }
+
             const existing = bookingsByShift.get(booking.shift_id) || [];
             existing.push(booking);
             bookingsByShift.set(booking.shift_id, existing);
@@ -869,11 +877,11 @@ app.get('/api/cancel-booking/:id', async (req, res) => {
     try {
         const { data: booking } = await supabase
             .from('bookings')
-            .select('id, full_name, event_id, events(title)')
+            .select('id, full_name, event_id, status, events(title)')
             .eq('id', id)
             .single();
 
-        if (!booking) {
+        if (!booking || isCanceledBookingStatus(booking.status)) {
             return res.status(404).send(cancelErrorHtml('This booking has already been cancelled or does not exist.'));
         }
 
@@ -896,11 +904,11 @@ app.post('/api/cancel-booking/:id', async (req, res) => {
     try {
         const { data: booking } = await supabase
             .from('bookings')
-            .select('id, full_name, event_id, events(title)')
+            .select('id, full_name, event_id, status, events(title)')
             .eq('id', id)
             .single();
 
-        if (!booking) {
+        if (!booking || isCanceledBookingStatus(booking.status)) {
             return res.status(404).send(cancelErrorHtml('This booking has already been cancelled or does not exist.'));
         }
 
@@ -1319,12 +1327,15 @@ app.post('/api/bookings', bookingRateLimit, async (req, res) => {
         failureStage = 'check_shift_capacity';
         const { data: existingBookings, error: bookingsErr } = await supabase
             .from('bookings')
-            .select('number_of_people')
+            .select('number_of_people, status')
             .eq('shift_id', shift.id);
 
         if (bookingsErr) throw bookingsErr;
 
-        const currentTotal = (existingBookings || []).reduce((sum, booking) => sum + (booking.number_of_people || 0), 0);
+        const currentTotal = (existingBookings || []).reduce(
+            (sum, booking) => isCanceledBookingStatus(booking.status) ? sum : sum + (booking.number_of_people || 0),
+            0
+        );
         observedCapacity = typeof shift.capacity === 'number' ? shift.capacity : null;
         observedCurrentTotal = currentTotal;
         observedRemainingSpots = observedCapacity && observedCapacity > 0
@@ -1430,6 +1441,7 @@ app.post('/api/bookings', bookingRateLimit, async (req, res) => {
                     email: normalizedEmail,
                     phone: normalizedPhone,
                     number_of_people: normalizedPeople,
+                    status: 'pending',
                     payment_status: 'pending',
                     bill: totalBill,
                     email_language: normalizedEmailLanguage
@@ -1618,14 +1630,18 @@ app.post('/api/bookings', bookingRateLimit, async (req, res) => {
 
                     const { data: allShiftBookings, error: allShiftBookingsError } = await supabase
                         .from('bookings')
-                        .select('id, number_of_people, email, full_name, email_language, bill')
+                        .select('id, number_of_people, email, full_name, email_language, bill, status')
                         .eq('shift_id', normalizedShiftId);
 
                     if (allShiftBookingsError) {
                         throw allShiftBookingsError;
                     }
 
-                    const emailTotalPeople = (allShiftBookings || []).reduce(
+                    const activeShiftBookings = (allShiftBookings || []).filter(
+                        (shiftBooking: any) => !isCanceledBookingStatus(shiftBooking.status)
+                    );
+
+                    const emailTotalPeople = activeShiftBookings.reduce(
                         (sum, shiftBooking) => sum + (Number(shiftBooking.number_of_people) || 0),
                         0
                     );
@@ -1663,8 +1679,8 @@ app.post('/api/bookings', bookingRateLimit, async (req, res) => {
                             throw confirmError;
                         }
 
-                        if (paymentInvitationTemplate && allShiftBookings) {
-                            const previousBookings = allShiftBookings.filter((shiftBooking: any) => shiftBooking.id !== booking.id);
+                        if (paymentInvitationTemplate && activeShiftBookings.length > 0) {
+                            const previousBookings = activeShiftBookings.filter((shiftBooking: any) => shiftBooking.id !== booking.id);
 
                             for (const previousBooking of previousBookings) {
                                 await sendTemplateEmail({
@@ -1736,6 +1752,30 @@ app.patch('/api/admin/bookings/status', requireAdmin, async (req, res) => {
         const { error } = await supabase
             .from('bookings')
             .update({ payment_status: status })
+            .in('id', bookingIds);
+
+        if (error) throw error;
+        res.json({ success: true });
+    } catch (error: any) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.patch('/api/admin/bookings/reservation-status', requireAdmin, async (req, res) => {
+    const { bookingIds, status } = req.body;
+    const normalizedStatus = normalizeLifecycleStatus(status) === 'cancelled'
+        ? 'canceled'
+        : normalizeLifecycleStatus(status);
+    const allowedStatuses = new Set(['pending', 'canceled']);
+
+    if (!Array.isArray(bookingIds) || bookingIds.length === 0 || !allowedStatuses.has(normalizedStatus)) {
+        return res.status(400).json({ error: 'Invalid booking reservation status update payload.' });
+    }
+
+    try {
+        const { error } = await supabase
+            .from('bookings')
+            .update({ status: normalizedStatus })
             .in('id', bookingIds);
 
         if (error) throw error;
@@ -1824,6 +1864,7 @@ app.post('/api/admin/validate-event', requireAdmin, (req, res) => {
     if (!data.title) errors.push('Title is required');
     if (!data.event_date || !isValidISODatetime(data.event_date)) errors.push('Valid event date and time are required');
     if (!data.booking_deadline || !isValidISODatetime(data.booking_deadline)) errors.push('Valid booking deadline is required');
+    if (!data.payment_deadline || !isValidISODatetime(data.payment_deadline)) errors.push('Valid payment deadline is required');
 
     if (errors.length > 0) {
         return res.status(400).json({ errors });
@@ -1852,6 +1893,7 @@ app.post('/api/admin/events', requireAdmin, async (req, res) => {
                 'price',
                 'event_date',
                 'booking_deadline',
+                'payment_deadline',
                 'location_name',
                 'location_address',
                 'location_url',
@@ -1960,6 +2002,7 @@ app.put('/api/admin/events/:id', requireAdmin, async (req, res) => {
             'price',
             'event_date',
             'booking_deadline',
+            'payment_deadline',
             'location_name',
             'location_address',
             'location_url',
