@@ -17,10 +17,24 @@ const resend = new Resend(process.env.RESEND_API_KEY);
 const app = express();
 const PORT = process.env.PORT || 3001;
 app.set('trust proxy', 1);
-const adminEmailAllowlist = (process.env.ADMIN_EMAILS || '')
-    .split(',')
-    .map((email) => email.trim().toLowerCase())
-    .filter(Boolean);
+const parseEmailList = (value: string | undefined) => {
+    const seen = new Set<string>();
+
+    return (value || '')
+        .split(',')
+        .map((email) => email.trim().toLowerCase())
+        .filter((email) => {
+            if (!email || seen.has(email)) {
+                return false;
+            }
+
+            seen.add(email);
+            return true;
+        });
+};
+
+const adminEmailAllowlist = parseEmailList(process.env.ADMIN_EMAILS);
+const privateEventAdminRecipients = parseEmailList(process.env.PRIVATE_EVENT_ADMIN_EMAIL);
 const defaultCorsAllowedOrigins = [
     'http://localhost:3000',
     'http://127.0.0.1:3000',
@@ -1085,8 +1099,11 @@ app.post('/api/private-event-inquiries', async (req, res) => {
 
         // Send Email Notification to Admin
         if (process.env.RESEND_API_KEY) {
-            const adminEmail = process.env.PRIVATE_EVENT_ADMIN_EMAIL || adminEmailAllowlist[0];
-            if (adminEmail) {
+            const adminRecipients = privateEventAdminRecipients.length > 0
+                ? privateEventAdminRecipients
+                : adminEmailAllowlist;
+
+            if (adminRecipients.length > 0) {
                 const safeMessage = message ? escapeHtml(message).replace(/\n/g, '<br/>') : 'No message provided';
                 const htmlBody = `
                     <h2>New Private Event Inquiry</h2>
@@ -1105,22 +1122,28 @@ app.post('/api/private-event-inquiries', async (req, res) => {
                 `;
 
                 try {
-                    await resend.emails.send({
+                    const { error: sendError } = await resend.emails.send({
                         from: process.env.EMAIL_FROM || 'info@weekplore.gr',
-                        to: adminEmail,
+                        to: adminRecipients,
                         subject: `New Private Event Inquiry from ${firstName} ${lastName}`,
                         html: htmlBody,
                     });
 
-                    await supabase.from('email_logs').insert([{
-                        booking_id: null,
-                        shift_id: null,
-                        event_id: null,
-                        recipient_email: adminEmail,
-                        email_purpose: 'private_event_admin_notification',
-                        status: 'sent',
-                        template_id: null
-                    }]);
+                    if (sendError) {
+                        throw sendError;
+                    }
+
+                    await supabase.from('email_logs').insert(
+                        adminRecipients.map((recipientEmail) => ({
+                            booking_id: null,
+                            shift_id: null,
+                            event_id: null,
+                            recipient_email: recipientEmail,
+                            email_purpose: 'private_event_admin_notification',
+                            status: 'sent',
+                            template_id: null
+                        }))
+                    );
                 } catch (emailErr: any) {
                     console.error('Failed to send admin notification email:', emailErr.message);
                 }
