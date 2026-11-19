@@ -4,6 +4,9 @@ import dotenv from 'dotenv';
 import { Resend } from 'resend';
 import { createClient } from '@supabase/supabase-js';
 import crypto from 'crypto';
+import sanitizeHtml from 'sanitize-html';
+import { normalizeNewsletterEmail, subscribeNewsletter } from './newsletter.js';
+import { createNewsletterWebhook } from './newsletterWebhook.js';
 
 dotenv.config();
 
@@ -178,6 +181,37 @@ const normalizeMultilineText = (value: unknown, maxLength = 4000) =>
         ? sanitizeStringInput(value, { maxLength, preserveNewlines: true })
         : '';
 
+const HTML_TAG_PATTERN = /<\/?[a-z][^>]*>/i;
+
+const sanitizeEventDescription = (value: unknown) => {
+    const normalized = normalizeMultilineText(value, 10000);
+    if (!normalized || !HTML_TAG_PATTERN.test(normalized)) {
+        return normalized;
+    }
+
+    return sanitizeHtml(normalized, {
+        allowedTags: ['p', 'br', 'strong', 'em', 'span'],
+        allowedAttributes: {
+            span: ['style'],
+        },
+        allowedStyles: {
+            span: {
+                color: [
+                    /^#(?:111111|4a3b2e)$/i,
+                    /^rgb\(\s*(?:17\s*,\s*17\s*,\s*17|74\s*,\s*59\s*,\s*46)\s*\)$/i,
+                ],
+                'font-family': [
+                    /^Inter(?:\s*,\s*sans-serif)?$/i,
+                    /^(?:'Instrument Serif'|"Instrument Serif"|Instrument Serif)(?:\s*,\s*serif)?$/i,
+                ],
+            },
+        },
+        allowedSchemes: [],
+        allowProtocolRelative: false,
+        enforceHtmlBoundary: true,
+    }).trim();
+};
+
 const escapeHtml = (value: string) =>
     value
         .replace(/&/g, '&amp;')
@@ -271,6 +305,7 @@ const attachProductCategoryData = (event: any) => {
 
     return {
         ...event,
+        full_description: sanitizeEventDescription(event?.full_description),
         product_categories: productCategories,
         products: flattenProductCategories(productCategories),
     };
@@ -1251,6 +1286,22 @@ app.post('/api/private-event-inquiries', async (req, res) => {
 
 // --- BOOKINGS ---
 
+app.post('/api/newsletter/brevo-webhook', createNewsletterWebhook(supabase));
+
+app.post('/api/newsletter/subscribe', bookingRateLimit, async (req, res) => {
+    const email = normalizeNewsletterEmail(req.body?.email);
+    if (!email || req.body?.consent !== true) {
+        res.status(400).json({ error: 'A valid email and newsletter consent are required.' });
+        return;
+    }
+    try {
+        const status = await subscribeNewsletter(supabase, email, 'website');
+        res.json({ status });
+    } catch {
+        res.status(503).json({ error: 'Newsletter signup is temporarily unavailable. Please try again later.' });
+    }
+});
+
 app.post('/api/bookings', bookingRateLimit, async (req, res) => {
     const { eventId, formData } = req.body ?? {};
     const normalizedEventId = Number(eventId);
@@ -1259,6 +1310,8 @@ app.post('/api/bookings', bookingRateLimit, async (req, res) => {
     const normalizedFullName = normalizeSingleLineText(formData?.fullName, 120);
     const normalizedEmail = normalizeEmail(formData?.email);
     const normalizedPhone = normalizePhone(formData?.phone);
+    const normalizedPostalCodeInput = normalizeSingleLineText(formData?.postalCode, 20);
+    const normalizedPostalCode = normalizedPostalCodeInput.replace(/\s/g, '');
     const normalizedEmailLanguage = normalizeEmailLanguage(formData?.email_language);
     const selectedProducts = Array.isArray(formData?.products) ? formData.products : [];
     const bookingAttemptId = crypto.randomUUID();
@@ -1279,9 +1332,26 @@ app.post('/api/bookings', bookingRateLimit, async (req, res) => {
         normalizedShiftId < 1 ||
         !normalizedFullName ||
         !normalizedEmail ||
-        !normalizedPhone
+        !normalizedPhone ||
+        !normalizedPostalCode
     ) {
         return res.status(400).json({ error: 'Missing required booking information' });
+    }
+
+    if (/[^0-9\s]/.test(normalizedPostalCodeInput)) {
+        return res.status(400).json({
+            error: normalizedEmailLanguage === 'el'
+                ? 'Χρησιμοποιήστε μόνο αριθμούς για τον Τ.Κ.'
+                : 'Use numbers only for the postal code.'
+        });
+    }
+
+    if (!/^[0-9]{5}$/.test(normalizedPostalCode)) {
+        return res.status(400).json({
+            error: normalizedEmailLanguage === 'el'
+                ? 'Ο Τ.Κ. πρέπει να αποτελείται από 5 ψηφία.'
+                : 'Postal code must contain 5 digits.'
+        });
     }
 
     if (!EMAIL_REGEX.test(normalizedEmail)) {
@@ -1463,6 +1533,7 @@ app.post('/api/bookings', bookingRateLimit, async (req, res) => {
                     full_name: normalizedFullName,
                     email: normalizedEmail,
                     phone: normalizedPhone,
+                    postal_code: normalizedPostalCode,
                     number_of_people: normalizedPeople,
                     status: 'pending',
                     payment_status: 'pending',
@@ -1725,6 +1796,17 @@ app.post('/api/bookings', bookingRateLimit, async (req, res) => {
             })();
         }
 
+        if (req.body?.formData?.newsletterOptIn === true) {
+            const newsletterEmail = normalizeNewsletterEmail(booking.email);
+            if (newsletterEmail) {
+                try {
+                    await subscribeNewsletter(supabase, newsletterEmail, 'booking');
+                } catch {
+                    // Newsletter delivery must never turn a saved booking into a failed booking.
+                    console.warn('Newsletter signup failed after successful booking', { bookingId: booking.id });
+                }
+            }
+        }
         res.json(booking);
     } catch (error: any) {
         console.error('Booking error:', {
@@ -1816,6 +1898,7 @@ app.get('/api/admin/events', requireAdmin, async (req, res) => {
             .from('events')
             .select(`
         *,
+        images:event_images(*),
         shifts(
           *,
           bookings(
@@ -1907,7 +1990,7 @@ app.post('/api/admin/events', requireAdmin, async (req, res) => {
             return res.status(400).json({ error: 'At least one shift is required to create an event.' });
         }
 
-        const safeEventData = {
+        const safeEventData: Record<string, unknown> = {
             ...pickDefined(eventData || {}, [
                 'title',
                 'slug',
@@ -1930,6 +2013,9 @@ app.post('/api/admin/events', requireAdmin, async (req, res) => {
             is_hidden: Boolean(eventData?.is_hidden),
             status: isNonEmptyString(eventData?.status) ? eventData.status : 'active',
         };
+
+        safeEventData.short_description = normalizeSingleLineText(safeEventData.short_description, 500);
+        safeEventData.full_description = sanitizeEventDescription(safeEventData.full_description);
 
         const { data: event, error: eventError } = await supabase
             .from('events')
@@ -2039,6 +2125,14 @@ app.put('/api/admin/events/:id', requireAdmin, async (req, res) => {
 
         if (Object.keys(safeEventData).length === 0) {
             return res.status(400).json({ error: 'No valid event fields provided.' });
+        }
+
+        if (safeEventData.short_description !== undefined) {
+            safeEventData.short_description = normalizeSingleLineText(safeEventData.short_description, 500);
+        }
+
+        if (safeEventData.full_description !== undefined) {
+            safeEventData.full_description = sanitizeEventDescription(safeEventData.full_description);
         }
 
         if (safeEventData.status !== undefined) {
